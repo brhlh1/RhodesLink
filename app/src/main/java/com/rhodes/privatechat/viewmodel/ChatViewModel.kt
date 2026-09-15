@@ -101,6 +101,14 @@ class ChatViewModel(
         private const val MAX_MERGED_USER_CHARS = 600
         private const val PRIVATE_REPLY_TIMEOUT_MS = 180_000L
         private const val PRIVATE_PROMPT_TIMEOUT_MS = 50_000L
+        /**
+         * Floor for the prompt-build history read. The build only needs the newest few messages (the
+         * recall query uses the last 3 and the prompt uses at most `history_messages`), so never read a
+         * whole multi-thousand-message session again.
+         */
+        private const val PROMPT_HISTORY_READ_FLOOR = 200
+        /** Optional (enhanced) context may only consume this much of the prompt budget in total. */
+        private const val OPTIONAL_CONTEXT_POOL_MS = 12_000L
         private const val PRIVATE_MODEL_TIMEOUT_MS = 120_000L
         private const val MESSAGE_WRITE_TIMEOUT_MS = 15_000L
         private const val PRIVATE_PERSONA_MAX_CHARS = 3_000
@@ -173,6 +181,14 @@ class ChatViewModel(
     private var messagesJob: Job? = null
     private val chatAiJobs = ConcurrentHashMap<String, Job>()
     private val promptBuildJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * Dedicated lane for prompt assembly. Prompt build used to run on Dispatchers.Default, so if that
+     * shared pool was ever fully occupied by blocked work, the build task never even started and the
+     * user saw an exact 50s "prompt_build" timeout with no sub-step ever recorded. A private lane cannot
+     * be starved by unrelated work.
+     */
+    private val promptBuildDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val privateMaintenanceJobs = ConcurrentHashMap<String, Job>()
     private val privateMaintenancePending = ConcurrentHashMap.newKeySet<String>()
     private val privateRestartCleanupJobs = ConcurrentHashMap<String, Job>()
@@ -1298,12 +1314,23 @@ ${text}"""
                 }
                 userMessagePersisted = true
                 replyLeaseToken = replyLeaseTokenOverride ?: UUID.randomUUID().toString()
+                // Schedule the recovery worker BEFORE claiming the lease. Claiming can be denied by a
+                // stale/orphaned reply_turn (for example when a reused message id collides with an old
+                // succeeded turn); previously that path returned silently, leaving the user message
+                // saved with no reply, no failure marker and no worker to pick it up later.
+                if (retryMessageId == null) {
+                    runCatching { com.rhodes.privatechat.automation.ManualReplyScheduler.scheduleTurn(getApplication(), replyTurnId) }
+                        .onFailure { DebugLogger.diagnostic("PrivateChat/ReplyRecoveryScheduleFailed", "sessionId=${session.id}, messageId=$msgId, error=${it.javaClass.simpleName}:${it.message?.take(120)}") }
+                }
                 if (replyLeaseTokenOverride == null) {
                     val claimedTurn = repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + PRIVATE_REPLY_TIMEOUT_MS)
-                    if (claimedTurn == null) return@launch
-                }
-                if (retryMessageId == null) {
-                    com.rhodes.privatechat.automation.ManualReplyScheduler.scheduleTurn(getApplication(), replyTurnId)
+                    if (claimedTurn == null) {
+                        DebugLogger.diagnostic("PrivateChat/ReplyTurnClaimFailed", "sessionId=${session.id}, messageId=$msgId, turnId=$replyTurnId, stage=claim_denied")
+                        failureSnapshot("reply_turn_claim_denied", null)
+                        DebugLogger.conversationStep(debugRoundId, "私聊", "回复任务租约", "已由其他任务处理", "未抢占租约；消息已保存，回复将交由恢复任务补上")
+                        if (retryMessageId == null) onShowToast("消息已保存，回复稍后自动补上")
+                        return@launch
+                    }
                 }
                 batchIds = setOf(msgId)
                 DebugLogger.chatEvent("私聊", "发送消息", "已保存", "会话=${session.operatorName}，模式=$mode")
@@ -1319,14 +1346,28 @@ ${text}"""
                 pipelineStage = "ai_mutex_wait"
                 aiMutexFor(session.id).lock()
                 mutexLocked = true
-                if ((sessionGenerations[session.id] ?: 0L) != generation) return@launch
+                if ((sessionGenerations[session.id] ?: 0L) != generation) {
+                    // The session was restarted / archived / erased while this send was in flight. The
+                    // old turn must not write into the new timeline, but it must not fail silently either.
+                    DebugLogger.diagnostic("PrivateChat/SendSuperseded", "sessionId=${session.id}, messageId=$msgId, turnId=$replyTurnId, stage=session_generation_changed")
+                    failureSnapshot("session_generation_changed", null)
+                    return@launch
+                }
                 chatAiJobs[session.id] = coroutineContext[Job]!!
                 beginLoading(session.id, requestId)
                 // Keep one durable reply turn per source message. Merging turn-owned messages
                 // would leave sibling turns pending and allow recovery to duplicate replies.
                 delay(250)
                 val pendingIds = pendingUserMessageIds[session.id].orEmpty()
-                if (msgId !in pendingIds) return@launch
+                if (msgId !in pendingIds) {
+                    // The send was superseded (cancel / restart / another turn already owns this message).
+                    // This used to be a silent return, so the user saw "no reply" with no explanation. The
+                    // turn stays with its lease and the finally block releases it, which lets the recovery
+                    // worker answer it — matching the "回复稍后自动补上" promise.
+                    DebugLogger.diagnostic("PrivateChat/SendSuperseded", "sessionId=${session.id}, messageId=$msgId, turnId=$replyTurnId, stage=pending_id_missing")
+                    failureSnapshot("pending_message_id_missing", null)
+                    return@launch
+                }
                 val candidateIds = listOf(msgId)
                 val batchMessages = repository.getMessagesSync(session.id)
                     .asSequence()
@@ -1373,7 +1414,7 @@ ${text}"""
                         DebugLogger.diagnostic("PrivateChat/ReplyStep", "sessionId=${session.id}, messageId=$msgId, step=prompt_start, history=$effectiveHistoryMessages")
                         recordReplyPipeline(session.id, msgId, "prompt_build_start")
                         promptBuildJobs.remove(session.id)?.cancel()
-                        val promptBuildJob = viewModelScope.async(Dispatchers.Default) {
+                        val promptBuildJob = viewModelScope.async(promptBuildDispatcher) {
                             buildApiMessages(session, text, effectiveHistoryMessages, batchIds.toSet(), mode = mode) { stage ->
                                 recordReplyPipeline(session.id, msgId, stage)
                                 recordContextStage(stage)
@@ -1505,6 +1546,9 @@ ${text}"""
                         break  // 成功，退出重试循环
                     } catch (e: ChatStageTimeoutException) {
                         val turnElapsed = turnStartedAt.elapsedNow().inWholeMilliseconds
+                        // Capture what every thread was doing at the moment of the timeout. The step trace
+                        // alone cannot explain a build that never started; a stack dump can.
+                        dumpThreadStacks("stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs}")
                         DebugLogger.diagnostic("ChatTimeout", "surface=private,roundId=$debugRoundId,sessionId=${session.id},stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs},turnBudgetMs=$PRIVATE_REPLY_TIMEOUT_MS,turnElapsedMs=$turnElapsed,remainingMs=${remainingTurnBudget()},exceptionType=${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}")
                         recordReplyPipeline(session.id, msgId, "${e.stage}_timeout", "budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs}")
                         DebugLogger.chatEvent("私聊", e.stage.chatStageLabel(), "超时", "预算=${e.budgetMs}ms，耗时=${e.elapsedMs}ms")
@@ -1602,6 +1646,13 @@ ${text}"""
                     val reason = when {
                         !userMessagePersisted -> "用户消息未保存"
                         pipelineStage == "ai_reply_write" -> "AI回复保存未完成"
+                        // Say which stage actually ended the round instead of a generic "中断或取消":
+                        // support could not tell a lost lease from a slow prompt build.
+                        pipelineStage == "ai_message_id" || pipelineStage == "ai_mutex_wait" -> "等待AI消息ID或会话互斥锁时被中断"
+                        pipelineStage.startsWith("prompt_") -> "提示词构建阶段被中断"
+                        pipelineStage.startsWith("context_") || pipelineStage == "history_read" -> "上下文/历史读取阶段被中断"
+                        pipelineStage == "session_read" -> "会话读取阶段被中断"
+                        pipelineStage.startsWith("model_") || pipelineStage == "ai_request" -> "模型请求阶段被中断"
                         else -> "流程在${pipelineStage}中断或取消"
                     }
                     finishDebugRound(result, "模式=$mode，阶段=$pipelineStage，原因=$reason")
@@ -2637,12 +2688,15 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
     ): T {
         val started = TimeSource.Monotonic.markNow()
         onStage?.invoke("${stage}_start")
+        tracePromptStep(stage, "start", 0L)
         return try {
             val result = withChatStageTimeout("private", module, budgetMs, block)
             onStage?.invoke("${stage}_done")
+            tracePromptStep(stage, "done", started.elapsedNow().inWholeMilliseconds)
             result
         } catch (error: ChatStageTimeoutException) {
             val elapsed = started.elapsedNow().inWholeMilliseconds
+            tracePromptStep(stage, "TIMEOUT", elapsed)
             DebugLogger.diagnostic("ChatTimeout", "surface=private,sessionId=$sessionId,stage=$module,budgetMs=$budgetMs,elapsedMs=$elapsed,exceptionType=${error.cause?.javaClass?.simpleName ?: error.javaClass.simpleName}")
             onStage?.invoke("${stage}_timeout")
             throw error
@@ -2661,22 +2715,68 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
         block: suspend () -> T,
     ): T {
         onStage?.invoke("${stage}_start")
+        val optionalStarted = TimeSource.Monotonic.markNow()
+        tracePromptStep(stage, "start", 0L)
         // Keep time for template assembly and the essential recent-history context.
         val effectiveBudget = minOf(budgetMs, (remainingPromptBudgetMs() - 2_000L).coerceAtLeast(0L))
         if (effectiveBudget < 1_000L) {
             onStage?.invoke("${stage}_degraded")
+            tracePromptStep(stage, "degraded(no_budget)", 0L)
             DebugLogger.log("PrivateChat/OptionalContext", "sessionId=$sessionId,module=$module,reason=prompt_budget_exhausted")
             return fallback
         }
         return try {
             withChatStageTimeout("private", module, effectiveBudget, block).also {
                 onStage?.invoke("${stage}_done")
+                tracePromptStep(stage, "done", optionalStarted.elapsedNow().inWholeMilliseconds)
             }
         } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException) throw error
+            val optionalElapsed = optionalStarted.elapsedNow().inWholeMilliseconds
+            tracePromptStep(stage, if (error is ChatStageTimeoutException) "TIMEOUT" else "degraded(${error.javaClass.simpleName})", optionalElapsed)
             DebugLogger.log("PrivateChat/OptionalContext", "sessionId=$sessionId,module=$module,reason=${error.javaClass.simpleName}; skipped")
             onStage?.invoke(if (error is ChatStageTimeoutException) "${stage}_timeout" else "${stage}_degraded")
             fallback
+        }
+    }
+
+    /**
+     * Writes every thread stack (state + top frames) to the plain trace store and logcat. This is the
+     * instrument that can answer "the prompt build never even started": the stack shows which threads are
+     * blocked and on what, instead of leaving us to infer it from timing.
+     */
+    private fun dumpThreadStacks(reason: String) {
+        runCatching {
+            val builder = StringBuilder()
+            Thread.getAllStackTraces().forEach { (thread, stack) ->
+                builder.append("\n[").append(thread.name).append(" state=").append(thread.state).append("]")
+                stack.take(14).forEach { frame -> builder.append("\n    at ").append(frame.toString().take(170)) }
+            }
+            val text = builder.toString().take(7000)
+            val prefs = getApplication<android.app.Application>()
+                .getSharedPreferences("rhodes_diag", android.content.Context.MODE_PRIVATE)
+            prefs.edit().putString("thread_dump", "$reason @${System.currentTimeMillis()}$text").commit()
+            android.util.Log.w("RhodesThreadDump", "$reason$text")
+        }
+    }
+
+    /**
+     * Plain-prefs trace of every prompt-build sub-step. It deliberately avoids the settings store: the
+     * chat pipeline's own step markers go through the Keystore-encrypted store, so when a build hangs on
+     * that store the evidence disappears with it. This file cannot be blocked by Keystore and is cheap.
+     */
+    private fun tracePromptStep(stage: String, status: String, elapsedMs: Long) {
+        runCatching {
+            val prefs = getApplication<android.app.Application>()
+                .getSharedPreferences("rhodes_diag", android.content.Context.MODE_PRIVATE)
+            val now = android.os.SystemClock.elapsedRealtime()
+            val line = "$stage:$status:${elapsedMs}ms"
+            val previous = prefs.getString("private_prompt_trace", "").orEmpty()
+            prefs.edit()
+                .putString("private_prompt_trace", (previous + "|" + line).takeLast(1500))
+                .putLong("private_prompt_trace_at", System.currentTimeMillis())
+                .commit()
+            android.util.Log.i("RhodesPromptTrace", line + " (t=" + now + ")")
         }
     }
 
@@ -2690,8 +2790,17 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
         onStage: ((String) -> Unit)? = null,
     ): List<AiMessage> {
         val promptStartedAt = TimeSource.Monotonic.markNow()
-        fun remainingPromptBudgetMs(): Long =
-            (PRIVATE_PROMPT_TIMEOUT_MS - promptStartedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(0L)
+        tracePromptStep("prompt_build", "start", 0L)
+        // Enhanced context (memory / relationship / public / knowledge base) is optional by design, so it
+        // must never be able to eat the whole prompt budget and fail the turn before the model is even
+        // called. Its pool starts on the first optional read and caps the total time they may consume.
+        var optionalContextStartedAtMs = 0L
+        fun remainingPromptBudgetMs(): Long {
+            if (optionalContextStartedAtMs == 0L) optionalContextStartedAtMs = android.os.SystemClock.elapsedRealtime()
+            val promptRemaining = (PRIVATE_PROMPT_TIMEOUT_MS - promptStartedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(0L)
+            val optionalUsed = (android.os.SystemClock.elapsedRealtime() - optionalContextStartedAtMs).coerceAtLeast(0L)
+            return minOf(promptRemaining, (OPTIONAL_CONTEXT_POOL_MS - optionalUsed).coerceAtLeast(0L))
+        }
         onStage?.invoke("prompt_operator_state_start")
         val op = withChatStageTimeout("private", "operator_read", 10_000L) { repository.getOperator(session.operatorId) }
             ?: appState.operators.value.firstOrNull { it.id == session.operatorId }
@@ -2711,8 +2820,25 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
         val transitionNotice = transition.takeIf { it.isNotBlank() }?.let { "【本轮互动变化】\n$it\n请从本轮开始按这项变化自然回应。" }.orEmpty()
         onStage?.invoke("prompt_operator_state_done")
         val wantsRecall = UnifiedMemoryContext.shouldIncludeTimeSummary(userContent)
-        val recallQuery = contextRead(session.id, "history_read", "prompt_history_read", 10_000L, onStage) { repository.getMessagesSync(session.id) }
-            .orEmpty()
+        // Read the session once and reuse the result. The prompt tail used to read the whole session
+        // again after every enhanced context had already spent the budget, which is what tipped builds
+        // over the 50s prompt limit.
+        // Read only the tail this build can actually use. getMessagesSync reads the ENTIRE session, and a
+        // long session (the failing log had message id 4984) made that single read block past both the
+        // inner 10s stage budget and the outer 50s prompt budget: the coroutine timeout cannot preempt a
+        // running SQLite query, so users saw "提示词构建 · 超时" while the model was never called.
+        val historyReadLimit = maxOf(historyLimitOverride ?: settings.historyMessages, PROMPT_HISTORY_READ_FLOOR)
+        val historyReadStartedAt = android.os.SystemClock.elapsedRealtime()
+        val sessionMessages = contextRead(session.id, "history_read", "prompt_history_read", 10_000L, onStage) {
+            // getRecentMessagesSync returns newest-first; the rest of this build assumes oldest-first
+            // (it slices the tail for the prompt and takeLast(3) for the recall query).
+            repository.getRecentMessagesSync(session.id, historyReadLimit.toLong()).reversed()
+        }.orEmpty()
+        DebugLogger.diagnostic(
+            "PrivateChat/PromptHistoryRead",
+            "sessionId=${session.id}, limit=$historyReadLimit, read=${sessionMessages.size}, elapsedMs=${android.os.SystemClock.elapsedRealtime() - historyReadStartedAt}"
+        )
+        val recallQuery = sessionMessages
             .takeLast(3)
             .map { message ->
                 if (message.isMe) "用户：${message.content.take(120)}"
@@ -2886,11 +3012,13 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
             com.rhodes.privatechat.data.PromptPlaceholderRegistry.runtimeKeys("private", mode)
         )
         sharedUtils.requireNoUnresolvedTemplateTokens(promptLayers.system, "private/$mode")
+        val traceTemplateStarted = TimeSource.Monotonic.markNow()
         val naturalRuntimeContext = sharedUtils.buildNaturalRuntimeContext("private", replacements)
+        tracePromptStep("template_render", "done", traceTemplateStarted.elapsedNow().inWholeMilliseconds)
         val templateRuntimeContext = if (isCustomTemplate) promptLayers.runtimeContext else ""
         val protocol = promptLayers.system
         onStage?.invoke("prompt_history_format_start")
-        val rawMsgs = repository.getMessagesSync(session.id).let { msgs ->
+        val rawMsgs = sessionMessages.let { msgs ->
             val scoped = historyBeforeMessageId?.let { targetId -> msgs.takeWhile { it.id != targetId } } ?: msgs
             val restartAt = settings.getSessionRestartAt(session.id)
             val currentConversation = if (restartAt > 0L) scoped.filter { it.timestamp >= restartAt } else scoped

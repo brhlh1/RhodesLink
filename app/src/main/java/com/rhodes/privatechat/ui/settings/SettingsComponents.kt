@@ -77,7 +77,27 @@ fun SaveableSettingsScaffold(
     fun requestSave() {
         if (saving) return
         saving = true
-        onSaveRequest?.invoke(::completeSave, ::cancelSave) ?: completeSave()
+        // The header button is disabled while `saving` is true, and `saving` used to depend entirely on the
+        // caller invoking completeSave/cancelSave. When that callback never returned (a jammed database lane,
+        // a stalled validation) the button stayed "保存中" forever - the reported "点保存没反应" on the
+        // settings screen. Release the lock on a timer and say what happened.
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val watchdog = Runnable {
+            if (saving) {
+                saving = false
+                android.util.Log.w("RhodesSave", "settings save callback never returned; button lock released")
+            }
+        }
+        handler.postDelayed(watchdog, 8_000L)
+        val complete = { handler.removeCallbacks(watchdog); completeSave() }
+        val cancel = { handler.removeCallbacks(watchdog); cancelSave() }
+        val request = onSaveRequest
+        if (request == null) {
+            handler.removeCallbacks(watchdog)
+            completeSave()
+        } else {
+            request(complete, cancel)
+        }
     }
 
     androidx.compose.runtime.LaunchedEffect(Unit) { settings.beginDraft() }

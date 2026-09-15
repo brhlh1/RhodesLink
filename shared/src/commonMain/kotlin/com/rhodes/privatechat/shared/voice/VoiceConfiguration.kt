@@ -48,3 +48,25 @@ fun createAsrGateway(endpoint: String, apiKey: String, modelName: String, provid
         DisabledAsrGateway()
     }
 }
+
+/**
+ * Explains the most common voice-setup failure. When no dedicated ASR key is set the app silently
+ * reuses the chat key, so any non-Aliyun chat provider (DeepSeek, OpenAI, ...) makes 语音识别 fail
+ * with a 401 that users cannot interpret. Returns null when there is nothing to warn about.
+ */
+fun asrKeyFallbackHint(
+    endpoint: String,
+    asrApiKey: String,
+    chatApiKey: String,
+    chatProvider: String = "",
+    asrProvider: String = "",
+): String? {
+    if (asrProvider == "xiaomi" || endpoint.contains("api.xiaomimimo.com")) return null
+    if (asrApiKey.isNotBlank() || chatApiKey.isBlank()) return null
+    if (!endpoint.contains("dashscope.aliyuncs.com")) return "未单独填写语音识别密钥，将复用聊天密钥。"
+    return if (chatProvider == "ali") {
+        "未单独填写语音识别密钥，将复用聊天密钥（当前聊天服务商为阿里云，通常可用）。"
+    } else {
+        "未单独填写语音识别密钥，会复用聊天密钥；当前聊天服务商不是阿里云百炼，语音识别会返回 401，请在此单独填写百炼 Key。"
+    }
+}

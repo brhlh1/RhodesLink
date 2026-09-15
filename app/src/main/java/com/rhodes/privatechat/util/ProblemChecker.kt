@@ -74,6 +74,17 @@ data class ProblemCheckProgress(
 object ProblemChecker {
     // A complete export diagnosis includes multiple independently timed backup reads.
     private const val TOTAL_TIMEOUT_MS = 300_000L
+    /**
+     * Probes that ignore cancellation keep their thread after timing out. Cap how many such leaked probes
+     * one check may accumulate: without this, repeated one-click checks could occupy every dispatcher
+     * thread and stop the app from producing replies at all.
+     */
+    private const val MAX_LEAKED_PROBES = 4
+    /** A private user message younger than this may simply still be in flight; do not call it a defect. */
+    private const val UNANSWERED_GRACE_MS = 10L * 60 * 1000
+    /** Only unanswered messages newer than this count as a defect; older ones are reported as history. */
+    private const val UNANSWERED_FAILURE_WINDOW_MS = 6L * 60 * 60 * 1000
+    private val leakedProbes = java.util.concurrent.atomic.AtomicInteger()
     private const val LOCAL_TIMEOUT_MS = 15_000L
     private const val COPY_TIMEOUT_MS = 30_000L
     private const val MODEL_PROBE_TIMEOUT_MS = 60_000L
@@ -105,7 +116,7 @@ object ProblemChecker {
         val checkId = UUID.randomUUID().toString().replace("-", "").take(8)
         if (!active.compareAndSet(null, checkId)) return active.get() ?: checkId
         val now = System.currentTimeMillis()
-        val names = listOf("cleanup_previous_probe", "db_native_read_probe", "db_native_backup_tables", "db_repository_read_probe", "embedding_compute_probe", "vector_diagnostics_probe", "memory_items_stats_probe", "backup_snapshot_timing_probe", "database_open", "database_schema", "database_counts", "persistent_state_probe", "prompt_template_integrity", "kb_sql_count", "kb_sql_metadata", "kb_sql_content_size", "knowledge_base_metadata", "knowledge_base_assignments", "knowledge_base_chunks", "knowledge_base_readiness", "vector_sql_count", "vector_sql_signature_size", "vector_sql_invalid_rows", "vector_config_probe", "vector_embedding_gateway_probe", "vector_store_query_probe", "vector_local_search_probe", "support_manual_probe", "support_transcript_probe", "session_integrity", "session_message_audit", "contacts_recovery", "database_copy_write_test", "backup_roles_sessions", "backup_relationships", "backup_messages", "backup_knowledge_bases", "backup_memories", "backup_anchors", "backup_memory_items", "backup_moments", "backup_moment_likes", "backup_moment_comments", "backup_diaries", "backup_archives_display", "backup_gifts", "backup_dispatches", "backup_shared_experiences", "backup_mahjong", "backup_settings_snapshot", "backup_snapshot_probe", "backup_file_probe", "private_message_probe", "private_pipeline_history", "private_pipeline_context", "private_pipeline_reply_parse", "private_pipeline_last_state", "group_message_probe", "group_pipeline_roster_history", "group_pipeline_context", "group_pipeline_reply_parse", "private_ai_probe", "group_ai_probe", "cleanup")
+        val names = listOf("cleanup_previous_probe", "db_native_read_probe", "db_native_backup_tables", "db_repository_read_probe", "embedding_compute_probe", "vector_diagnostics_probe", "memory_items_stats_probe", "backup_snapshot_timing_probe", "database_open", "database_schema", "database_counts", "persistent_state_probe", "prompt_template_integrity", "kb_sql_count", "kb_sql_metadata", "kb_sql_content_size", "knowledge_base_metadata", "knowledge_base_assignments", "knowledge_base_chunks", "knowledge_base_readiness", "vector_sql_count", "vector_sql_signature_size", "vector_sql_invalid_rows", "vector_config_probe", "vector_embedding_gateway_probe", "vector_store_query_probe", "vector_local_search_probe", "support_manual_probe", "support_transcript_probe", "session_integrity", "session_message_audit", "contacts_recovery", "database_copy_write_test", "backup_roles_sessions", "backup_relationships", "backup_messages", "backup_knowledge_bases", "backup_memories", "backup_anchors", "backup_memory_items", "backup_moments", "backup_moment_likes", "backup_moment_comments", "backup_diaries", "backup_archives_display", "backup_gifts", "backup_dispatches", "backup_shared_experiences", "backup_mahjong", "backup_settings_snapshot", "backup_snapshot_probe", "backup_file_probe", "private_message_probe", "private_pipeline_history", "private_pipeline_context", "private_pipeline_reply_parse", "private_pipeline_last_state", "group_message_probe", "group_pipeline_roster_history", "group_pipeline_context", "group_pipeline_reply_parse", "private_ai_probe", "group_ai_probe", "environment_probe", "private_prompt_trace_probe", "cleanup")
         current.set(ProblemCheckProgress(checkId, now, now + TOTAL_TIMEOUT_MS, currentStage = "starting", stages = names.associateWith { StageProgress() }))
         startDetachedLocalProbe(checkId, "cleanup_previous_probe", LOCAL_TIMEOUT_MS) {
             val files = cleanupOldProbes(context)
@@ -119,6 +130,8 @@ object ProblemChecker {
         startDetachedLocalProbe(checkId, "db_native_read_probe", LOCAL_TIMEOUT_MS) { nativeDatabaseReadProbe(context) }
         startDetachedLocalProbe(checkId, "db_native_backup_tables", LOCAL_TIMEOUT_MS) { nativeBackupTableProbe(context) }
         startDetachedLocalProbe(checkId, "db_repository_read_probe", LOCAL_TIMEOUT_MS) { repositoryDatabaseReadProbe(repository) }
+        startDetachedLocalProbe(checkId, "environment_probe", COPY_TIMEOUT_MS) { environmentProbe(context) }
+        startDetachedLocalProbe(checkId, "private_prompt_trace_probe", LOCAL_TIMEOUT_MS) { promptTraceProbe(context) }
         startDetachedLocalProbe(checkId, "embedding_compute_probe", LOCAL_TIMEOUT_MS) { localEmbeddingComputeProbe() }
         startDetachedLocalProbe(checkId, "vector_diagnostics_probe", LOCAL_TIMEOUT_MS) { vectorDiagnosticsProbe() }
         startDetachedLocalProbe(checkId, "memory_items_stats_probe", LOCAL_TIMEOUT_MS) { memoryItemsStatsProbe(context) }
@@ -178,10 +191,34 @@ object ProblemChecker {
     }
 
     private suspend fun launchProbe(checkId: String, name: String, timeoutMs: Long, block: suspend () -> Any?) {
-        if (progress().abandoned) return
+        if (leakedProbes.get() >= MAX_LEAKED_PROBES) {
+            mark(
+                checkId, name, ProblemStageStatus.NOT_RUN,
+                detail = "reason=probe_slots_exhausted,leaked=$MAX_LEAKED_PROBES;restart_the_app_before_the_next_check"
+            )
+            return
+        }
         mark(checkId, name, ProblemStageStatus.RUNNING)
         val started = SystemClock.elapsedRealtime()
-        val result = runCatching { withTimeoutOrNull(timeoutMs) { block() } ?: throw SocketTimeoutException("stage timeout") }
+        // Run the probe in its own child job and only WAIT for it with a timeout. Several probes do
+        // blocking work (SQLite reads, fsync-style writes) that ignores coroutine cancellation: running
+        // them inline meant one stuck stage burned the whole 300s budget, after which every later stage
+        // was skipped and the report only said "总自检截止前未获得完整结果" - which is exactly why a
+        // one-click check could be repeated forever without ever naming the failing step.
+        var value: Any? = null
+        var failure: Throwable? = null
+        leakedProbes.incrementAndGet()
+        val job = checkScope(checkId).launch {
+            runCatching { block() }.fold(onSuccess = { value = it }, onFailure = { failure = it })
+        }
+        val timedOut = withTimeoutOrNull(timeoutMs) { job.join() } == null
+        // It finished in time, so its thread is free again; only a genuinely stuck probe stays counted.
+        if (!timedOut) leakedProbes.decrementAndGet()
+        val result: Result<Any?> = when {
+            timedOut -> Result.failure(SocketTimeoutException("stage timeout"))
+            failure != null -> Result.failure(failure!!)
+            else -> Result.success(value)
+        }
         val elapsed = SystemClock.elapsedRealtime() - started
         result.fold(
             onSuccess = { mark(checkId, name, ProblemStageStatus.SUCCESS, elapsed, it?.toString().orEmpty()) },
@@ -231,7 +268,7 @@ object ProblemChecker {
     private fun mark(checkId: String, name: String, status: ProblemStageStatus, elapsed: Long = 0L, detail: String = "") {
         while (true) {
             val old = progress()
-            if (old.checkId != checkId || old.abandoned) return
+            if (old.checkId != checkId) return
             val now = System.currentTimeMillis()
             val previous = old.stages[name] ?: StageProgress()
             val stage = if (status == ProblemStageStatus.RUNNING) previous.copy(status = status, startedAt = now) else previous.copy(status = status, finishedAt = now, elapsedMs = elapsed, detail = detail)
@@ -413,20 +450,105 @@ object ProblemChecker {
             Triple("backup_mahjong", LOCAL_TIMEOUT_MS, suspend { backupMahjongProbe(repository) }),
             Triple("backup_settings_snapshot", COPY_TIMEOUT_MS, suspend { backupSettingsProbe(repository) }),
         )
+        var firstBlockedStage: String? = null
         for ((name, timeout, action) in stages) {
-            if (progress().abandoned) return
+            // Deliberately no "abandoned" short-circuit here: the global deadline must only annotate the
+            // report, never stop the remaining probes. A user's one-click check could otherwise end with
+            // "总自检截止前未获得完整结果" and no way to tell which stage actually broke.
             startDetachedLocalProbe(checkId, name, timeout) { action() }
             awaitReportedStage(checkId, name)
-            if (progress().stages[name]?.status != ProblemStageStatus.SUCCESS) {
-                val remaining = stages.dropWhile { it.first != name }.drop(1).map { it.first } + "backup_snapshot_probe"
-                remaining.forEach { pending ->
-                    mark(checkId, pending, ProblemStageStatus.NOT_RUN, detail = "reason=skipped_after_first_database_failure,blockedAt=$name;inspect_db_native_backup_tables_for_table_and_field_metrics")
-                }
-                return
+            val stageStatus = progress().stages[name]?.status
+            if (stageStatus != ProblemStageStatus.SUCCESS) {
+                // Never skip the remaining stages. This branch used to mark every later stage as NOT_RUN
+                // ("skipped_after_first_database_failure") and return, so one slow or failing probe hid the
+                // entire private-chat chain from the report. Each probe is timeout-guarded and isolated, so
+                // the rest of the picture is still recoverable - keep going and only note the first blocker.
+                if (firstBlockedStage == null) firstBlockedStage = "$name:${stageStatus?.name?.lowercase()}"
             }
+        }
+        firstBlockedStage?.let { blocked ->
+            DebugLogger.diagnostic("Special/ProblemCheckLane", "firstBlockedStage=$blocked,note=remaining_stages_still_executed")
         }
         startDetachedLocalProbe(checkId, "backup_snapshot_probe", COPY_TIMEOUT_MS) { backupSnapshotTimingProbe(repository, appState) }
         mark(checkId, "backup_snapshot_timing_probe", ProblemStageStatus.NOT_RUN, detail = "reason=reported_by_backup_snapshot_probe;avoids_concurrent_full_snapshot")
+    }
+
+    /**
+     * Numbers that separate "old install state" from "code path". Android rewrites the ENTIRE prefs XML on
+     * every commit(), so a big settings store plus a slow or nearly-full device turns each settings write
+     * into a long fsync - and fsync cannot be interrupted by a coroutine timeout. That is the profile of a
+     * chat round that stalls for 50s with the model never called, so the report must carry these numbers.
+     */
+    private fun environmentProbe(context: Context): String {
+        val prefs = context.getSharedPreferences("rhodes_settings", Context.MODE_PRIVATE)
+        val entryCount = prefs.all.size
+        val prefsFile = java.io.File(java.io.File(context.applicationInfo.dataDir, "shared_prefs"), "rhodes_settings.xml")
+        val prefsBytes = if (prefsFile.exists()) prefsFile.length() else -1L
+        // The settings the app actually uses live in the Keystore-encrypted store; the plain file above is
+        // only legacy/fallback. Measuring the wrong file once made this probe look innocent, so both are
+        // reported now, together with the mode the app is currently running in.
+        val secure = context.getSharedPreferences("rhodes_settings_secure", Context.MODE_PRIVATE)
+        val secureFile = java.io.File(java.io.File(context.applicationInfo.dataDir, "shared_prefs"), "rhodes_settings_secure.xml")
+        val secureEntries = runCatching { secure.all.size }.getOrDefault(-1)
+        val secureBytes = if (secureFile.exists()) secureFile.length() else -1L
+        val plainMode = prefs.getBoolean("diagnostic_use_plain_settings", false)
+        val commitStart = SystemClock.elapsedRealtime()
+        runCatching {
+            // Measure a real synchronous commit of the plain store, then remove the marker (no residue).
+            prefs.edit().putLong("probe_commit_marker_ms", commitStart).commit()
+            prefs.edit().remove("probe_commit_marker_ms").commit()
+        }
+        val commitMs = SystemClock.elapsedRealtime() - commitStart
+        // Time a REAL commit on the store the app actually uses. Every encrypted commit re-encrypts and
+        // rewrites the whole secure file through Keystore, and the chat pipeline writes its step markers
+        // through this store - so a slow secure commit is the profile of "prompt_build burns exactly the
+        // 50s budget". This measurement decides it inside a single report, without any user experiment.
+        val secureCommitMs = runCatching {
+            com.rhodes.privatechat.shared.settings.measureSecureSettingsCommit()
+        }.getOrDefault(-1L)
+        val db = context.getDatabasePath("rhodes_terminal.db")
+        fun bytes(file: java.io.File?): Long = if (file != null && file.exists()) file.length() else 0L
+        val stat = android.os.StatFs(context.filesDir.path)
+        return "settingsMode=${if (plainMode) "PLAIN_DIAGNOSTIC" else "ENCRYPTED"}," +
+            "plainPrefsEntries=$entryCount,plainPrefsBytes=$prefsBytes,plainPrefsCommitMs=$commitMs," +
+            "securePrefsEntries=$secureEntries,securePrefsBytes=$secureBytes,secureCommitMs=$secureCommitMs," +
+            "dbBytes=${bytes(db)},dbWalBytes=${bytes(java.io.File(db.path + "-wal"))}," +
+            "dbJournalBytes=${bytes(java.io.File(db.path + "-journal"))}," +
+            "freeStorageMb=${stat.availableBytes / 1024 / 1024},totalStorageMb=${stat.totalBytes / 1024 / 1024}"
+    }
+
+    /**
+     * Dumps the plain-prefs prompt-build trace. It lives outside the encrypted settings store on purpose:
+     * when a build hangs inside that store, its own step markers can never be written, and this trace is
+     * what still tells us which sub-step was reached and how long each earlier sub-step took.
+     */
+    private fun promptTraceProbe(context: Context): String {
+        val prefs = context.getSharedPreferences("rhodes_diag", Context.MODE_PRIVATE)
+        val trace = prefs.getString("private_prompt_trace", "").orEmpty()
+        val at = prefs.getLong("private_prompt_trace_at", 0L)
+        val dump = prefs.getString("thread_dump", "").orEmpty()
+        val ageSeconds = if (at > 0L) (System.currentTimeMillis() - at) / 1000 else -1L
+        val tracePart = if (trace.isBlank()) "trace=<empty>" else "trace=$trace"
+        val dumpPart = if (dump.isBlank()) "threadDump=<none>" else "threadDump=${dump.replace('\n', ' ').replace("    ", " ").take(3000)}"
+        // Channel-occupancy check: a task sitting in runBlocking/joinBlocking parks a thread of the shared
+        // dispatcher, and prompt assembly needs that same pool, so ONE such task can stall every reply. This
+        // used to be invisible in the report and only surfaced by a lucky thread dump; now the offenders are
+        // named on every check.
+        val blocked = runCatching {
+            Thread.getAllStackTraces().entries.mapNotNull { (thread, stack) ->
+                val blocking = stack.any {
+                    it.methodName == "joinBlocking" || it.methodName == "runBlocking" ||
+                        it.className.contains("BuildersKt__BuildersKt")
+                }
+                if (!blocking) return@mapNotNull null
+                val offender = stack.firstOrNull { it.className.startsWith("com.rhodes") }
+                    ?.let { "${it.className.substringAfterLast('.')}.${it.methodName}" } ?: "unknown"
+                "${thread.name}->$offender"
+            }
+        }.getOrDefault(emptyList())
+        val blockedPart = if (blocked.isEmpty()) "blockedThreads=<none>" else "blockedThreads=${blocked.joinToString(";").take(600)}"
+        if (trace.isBlank() && dump.isBlank()) return "ageSeconds=$ageSeconds,note=no_prompt_build_since_install;$blockedPart"
+        return "ageSeconds=$ageSeconds,$tracePart;$dumpPart;$blockedPart"
     }
 
     private fun stageDisplayName(name: String): String = when (name) {
@@ -490,7 +612,13 @@ object ProblemChecker {
         p.stages["contacts_recovery"]?.status != ProblemStageStatus.SUCCESS -> "CONTACTS_RECOVERY_FAILED"
         p.stages["session_message_audit"]?.status == ProblemStageStatus.SUCCESS &&
             p.stages["session_message_audit"]?.detail?.contains("issues=") == true &&
-            !p.stages["session_message_audit"]!!.detail.contains("issues=0") -> "SESSION_MESSAGE_MAPPING_FAILED"
+            // The audit's "issues" counter includes benign notes (an empty preview group, a one-message
+            // session), and deriving the primary conclusion from it hijacked the report: a healthy install
+            // was reported as SESSION_MESSAGE_MAPPING_FAILED while every real probe passed. Only genuine
+            // integrity faults (orphan rows, name mismatches) should drive this conclusion.
+            p.stages["session_integrity"]?.detail?.contains("orphanMessages=0") == false ||
+                p.stages["session_integrity"]?.detail?.contains("orphanPrivateSessions=0") == false ||
+                p.stages["session_integrity"]?.detail?.contains("operatorNameMismatches=0") == false -> "SESSION_MESSAGE_MAPPING_FAILED"
         p.stages["private_message_probe"]?.status != ProblemStageStatus.SUCCESS -> "PRIVATE_MESSAGE_PIPELINE_FAILED"
         p.stages["group_message_probe"]?.status != ProblemStageStatus.SUCCESS -> "GROUP_MESSAGE_PIPELINE_FAILED"
         p.stages["private_ai_probe"]?.status != ProblemStageStatus.SUCCESS -> "PRIVATE_AI_RESPONSE_FAILED"
@@ -861,17 +989,41 @@ object ProblemChecker {
     private suspend fun privatePipelineHistoryProbe(repository: ChatRepository): String {
         val sessions = repository.getAllSessionsSync().filterNot { it.operatorId.startsWith("group_") || isDiagnosticSession(it) }
         if (sessions.isEmpty()) return "skipped=no_existing_private_session"
-        val missingReplies = mutableListOf<String>()
+        val now = System.currentTimeMillis()
+        val unanswered = mutableListOf<Pair<String, Long>>()
         var totalMessages = 0
         sessions.forEach { session ->
             val messages = repository.getMessagesSync(session.id)
             totalMessages += messages.size
-            val users = messages.count { it.isMe }
+            val users = messages.filter { it.isMe }
             val replies = messages.count { !it.isMe && it.type == "ai_json" }
-            if (users > 0 && replies == 0) missingReplies += session.id
+            if (users.isNotEmpty() && replies == 0) {
+                val newestUserTimestamp = users.maxOfOrNull { it.timestamp } ?: 0L
+                // Legacy rows can carry timestamp <= 0. Treating those as "sent in 1970" made the probe
+                // declare a corrupt-but-harmless session a stuck one; an unknown timestamp is unknown, so
+                // it is reported as in-flight instead of raising a failure.
+                val newestUserAgeMs = if (newestUserTimestamp <= 0L) 0L else now - newestUserTimestamp
+                unanswered += session.id to newestUserAgeMs
+            }
         }
-        check(missingReplies.isEmpty()) { "private sessions have user messages but no stored AI replies: ${missingReplies.joinToString(",")}" }
-        return "sessions=${sessions.size},historyRead=true,totalMessages=$totalMessages,allUserSessionsHaveReplies=true"
+        // Only a RECENT unanswered message is a defect. Older ones are history: a user can send one message,
+        // leave and never come back, and treating that as a failure made a healthy install report "failed"
+        // (one 8-hour-old single-message session was enough to fail the whole check).
+        val recent = unanswered.filter { it.second > UNANSWERED_GRACE_MS && it.second <= UNANSWERED_FAILURE_WINDOW_MS }
+        val inFlight = unanswered.filter { it.second <= UNANSWERED_GRACE_MS }
+        val historical = unanswered.filter { it.second > UNANSWERED_FAILURE_WINDOW_MS }
+        val notes = buildList {
+            if (inFlight.isNotEmpty()) add("unanswered_in_flight=${inFlight.joinToString(";") { "${it.first}(age=${it.second / 1000}s)" }}")
+            if (historical.isNotEmpty()) add("historical_unanswered=${historical.joinToString(";") { "${it.first}(age=${it.second / 1000}s)" }}")
+        }
+        if (recent.isEmpty()) {
+            return "sessions=${sessions.size},historyRead=true,totalMessages=$totalMessages,allUserSessionsHaveReplies=true" +
+                if (notes.isEmpty()) "" else "," + notes.joinToString(",")
+        }
+        throw IllegalStateException(
+            "private sessions unanswered for ${UNANSWERED_GRACE_MS / 60_000}min-${UNANSWERED_FAILURE_WINDOW_MS / 3_600_000}h: " +
+                recent.joinToString(",") { "${it.first}(age=${it.second / 1000}s)" }
+        )
     }
 
     /** Verifies prompt prerequisites without composing or transmitting user-derived context. */

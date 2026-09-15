@@ -62,6 +62,13 @@ WHERE id = ?;
 updateKnowledgeBaseIndexStatus:
 UPDATE knowledge_bases SET indexStatus = ?, indexedEmbeddingSignature = ?, updatedAt = ? WHERE id = ?;
 
+-- Marks every book that currently claims to be indexed as needing a rebuild. Raw content and chunks
+-- are never touched: re-indexing is the user's decision and may cost API calls.
+markKnowledgeBasesPendingReindex:
+UPDATE knowledge_bases
+SET indexStatus = 'pending', indexedEmbeddingSignature = '', updatedAt = ?
+WHERE indexStatus != 'pending' OR indexedEmbeddingSignature != '';
+
 renameKnowledgeBase:
 UPDATE knowledge_bases SET name = ?, updatedAt = ? WHERE id = ?;
 

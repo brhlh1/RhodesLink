@@ -96,8 +96,16 @@ object GroupAutoChatScheduler {
         WorkManager.getInstance(context).cancelUniqueWork(workName(groupId))
     }
 
-    fun reconcile(context: Context, repository: ChatRepository, settings: SettingsRepository) = runBlocking {
-        if (!settings.autoAiEnabled) return@runBlocking
+    fun reconcile(context: Context, repository: ChatRepository, settings: SettingsRepository) =
+        runBlocking { reconcileSuspending(context, repository, settings) }
+
+    /**
+     * Suspend form. The runBlocking wrapper parked a thread of the shared dispatcher, and private-chat
+     * prompt assembly reads the database through that same pool - one blocked task was enough to make the
+     * first read of a reply queue until the 50s prompt_build timeout (proven by a thread dump on device).
+     */
+    suspend fun reconcileSuspending(context: Context, repository: ChatRepository, settings: SettingsRepository) {
+        if (!settings.autoAiEnabled) return
         repository.getAllSessionsSync()
             .filter { it.operatorId.startsWith("group_") || it.operatorId.startsWith("group") }
             .filter { settings.getGroupAuto(it.id) }

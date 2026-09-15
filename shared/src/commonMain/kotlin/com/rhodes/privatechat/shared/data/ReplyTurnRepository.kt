@@ -58,5 +58,41 @@ class ReplyTurnRepository(private val wrapper: DatabaseWrapper) {
         db.replyTurnsQueries.deleteReplyTurnsBySession(sessionId)
     }
 
+    /** Deletes the turn that belongs to a single source message (ids are globally unique). */
+    suspend fun deleteBySourceMessageId(messageId: Long) = withContext(DatabaseDispatcher.dispatcher) {
+        db.replyTurnsQueries.deleteReplyTurnsBySourceMessageId(messageId)
+    }
+
+    /**
+     * Drops only *succeeded* turns whose source message no longer exists. These are orphans left behind
+     * by recall / archive-load / erase paths and they can block a later message that reuses the same id.
+     * Pending or running turns are never touched here: a recovery worker may still own them.
+     */
+    suspend fun cleanupOrphanedSucceededTurns(): Long = withContext(DatabaseDispatcher.dispatcher) {
+        val orphanCount = db.replyTurnsQueries.countOrphanedSucceededReplyTurns().executeAsOne()
+        if (orphanCount > 0L) db.replyTurnsQueries.deleteOrphanedSucceededReplyTurns()
+        orphanCount
+    }
+
     suspend fun deleteAll() = withContext(DatabaseDispatcher.dispatcher) { db.replyTurnsQueries.deleteAllReplyTurns() }
+
+    /**
+     * Terminal state for a turn that must never produce a reply: its user message was folded into a
+     * merged batch owned by another turn, or the send was superseded. Without this the turn stayed
+     * `running`, the lease expired, and the recovery worker answered the same message a second time.
+     */
+    suspend fun cancel(id: String, error: String, now: Long = System.currentTimeMillis()) =
+        withContext(DatabaseDispatcher.dispatcher) {
+            db.replyTurnsQueries.cancelReplyTurn(now, error, id)
+        }
+
+    /**
+     * Ids of recent manual turns that still need a reply but have no worker left to drive them: due
+     * pending/failed turns and running turns whose lease has expired. Startup re-arms these, which is
+     * what makes "消息已保存，回复稍后自动补上" true even after the process was killed.
+     */
+    suspend fun retryableTurnIds(since: Long, now: Long, limit: Long = 50L): List<String> =
+        withContext(DatabaseDispatcher.dispatcher) {
+            db.replyTurnsQueries.selectRetryableReplyTurns(since, now, limit).executeAsList()
+        }
 }

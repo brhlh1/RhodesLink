@@ -82,8 +82,12 @@ DELETE FROM chat_messages WHERE sessionId = ?;
 deleteMessage:
 DELETE FROM chat_messages WHERE id = ?;
 
+-- Retention deletion must never touch rows whose timestamp is not a real date. The legacy repair in
+-- DatabaseCompatibility rewrites rows without a timestamp to values one second before their neighbour,
+-- which lands in 1970 whenever that neighbour was stored in seconds - and the sweep then deleted the
+-- very rows it had just repaired. saneFloor is 2000-01-01: the app did not exist before it.
 deleteOldMessages:
-DELETE FROM chat_messages WHERE timestamp < ?;
+DELETE FROM chat_messages WHERE timestamp < :cutoff AND timestamp >= :saneFloor;
 
 deleteAllMessages:
 DELETE FROM chat_messages;

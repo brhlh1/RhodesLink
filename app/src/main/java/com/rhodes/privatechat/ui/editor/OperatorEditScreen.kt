@@ -753,6 +753,19 @@ fun NewOperatorScreen(
         }
         saving = true
         DebugLogger.diagnostic("NewOperator/SaveRequested", "operatorId=$operatorId, nameLength=${cleanName.length}, promptLengths=${privatePrompt.length}/${groupPrompt.length}")
+        // The save button is gated on `saving`, and `saving` used to be cleared ONLY inside onComplete. When
+        // the write never completed - for example while the startup backlog held the database lane - the flag
+        // stayed true forever, every later tap hit `if (!saving)` and the button looked dead. That is the
+        // reported "点保存没反应". Release the lock and tell the user instead of failing silently.
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val watchdog = Runnable {
+            if (saving) {
+                saving = false
+                DebugLogger.diagnostic("NewOperator/SaveWatchdog", "operatorId=$operatorId, note=onComplete_never_fired_flag_released")
+                android.widget.Toast.makeText(context, "保存结果未返回，请返回本页确认是否已保存成功（不要重复保存）", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+        handler.postDelayed(watchdog, 8_000L)
         viewModel.saveOperator(
             id = operatorId,
             name = cleanName,
@@ -761,6 +774,7 @@ fun NewOperatorScreen(
             privatePrompt = privatePrompt.trim(),
             groupPrompt = groupPrompt.trim(),
             onComplete = { error ->
+                handler.removeCallbacks(watchdog)
                 saving = false
                 if (error == null) {
                     DebugLogger.diagnostic("NewOperator/SaveSucceeded", "operatorId=$operatorId")

@@ -96,20 +96,25 @@ fun KnowledgeBasesScreen(onBack: () -> Unit, onOpen: (String) -> Unit, modifier:
             DebugLogger.diagnostic("KnowledgeBase/ListStatsFailed", "errorClass=${error.javaClass.simpleName},errorMessage=${error.message?.take(160)},dbTask=${db.runningTask},dbRunningMs=${db.runningForMs},dbQueued=${db.queuedTasks}")
             bookStats
         }
-        if (settings.vectorProviderMode == "third_party" && remoteConfirm == null) {
-            books.firstOrNull { it.indexStatus == "pending_confirm" && it.id !in deferredRemoteConfirmationIds }?.let { pending ->
-                runCatching { if (pending.indexStatus == "partial_pending_confirm") viewModel.planPendingKnowledgeBaseIndex(pending.id).chunkCount else viewModel.planKnowledgeBaseIndex(pending.id).chunkCount }
-                    .onSuccess { remoteChunkCount = it; remoteConfirm = pending }
-            }
+        // Any book that is waiting for an index confirmation must be able to get one. This used to be
+        // gated on vectorProviderMode == "third_party", so a book created while any other stored mode was
+        // active stayed at "已分段，等待确认索引" forever and looked like "知识库增加不了".
+        books.firstOrNull { it.indexStatus == "pending_confirm" && it.id !in deferredRemoteConfirmationIds }?.let { pending ->
+            runCatching { if (pending.indexStatus == "partial_pending_confirm") viewModel.planPendingKnowledgeBaseIndex(pending.id).chunkCount else viewModel.planKnowledgeBaseIndex(pending.id).chunkCount }
+                .onSuccess { remoteChunkCount = it; remoteConfirm = pending }
         }
         if (initial) loading = false
     }
     androidx.compose.runtime.LaunchedEffect(Unit) {
         refresh(initial = true)
         while (true) {
-            val hasActiveWork = books.any {
-                it.indexStatus == "processing" || it.indexStatus == "pending_confirm" ||
-                    it.indexStatus == "indexing" || it.indexStatus.startsWith("indexing:")
+            // A book the user deferred ("稍后") is not active work: keeping it in this set made the screen
+            // poll the database once per second forever while it sat at 等待确认索引.
+            val hasActiveWork = books.any { book ->
+                book.id !in deferredRemoteConfirmationIds && (
+                    book.indexStatus == "processing" || book.indexStatus == "pending_confirm" ||
+                        book.indexStatus == "indexing" || book.indexStatus.startsWith("indexing:")
+                    )
             }
             if (hasActiveWork) {
                 delay(1_000)
@@ -138,7 +143,7 @@ fun KnowledgeBasesScreen(onBack: () -> Unit, onOpen: (String) -> Unit, modifier:
                 ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
                 ?.ifBlank { null }
                 ?: "导入知识库.txt"
-            val bytes = runCatching {
+            val readResult = runCatching {
                 withContext(Dispatchers.IO) {
                     context.contentResolver.openInputStream(uri)?.use { input ->
                         val limit = com.rhodes.privatechat.shared.knowledge.KnowledgeBaseTextProcessor.MAX_FILE_BYTES
@@ -147,15 +152,18 @@ fun KnowledgeBasesScreen(onBack: () -> Unit, onOpen: (String) -> Unit, modifier:
                         while (true) {
                             val read = input.read(buffer)
                             if (read < 0) break
-                            if (output.size() + read > limit) throw IllegalArgumentException("知识库文件不能超过 2 MB")
+                            if (output.size() + read > limit) throw IllegalArgumentException("知识库文件不能超过 ${limit / (1024 * 1024)} MB")
                             output.write(buffer, 0, read)
                         }
                         output.toByteArray()
                     }
                 }
-            }.getOrNull()
+            }
+            val bytes = readResult.getOrNull()
             if (bytes == null) {
-                message = "无法读取所选文件"
+                // The reader throws specific reasons (size limit, unreadable stream). Collapsing them all
+                // into "无法读取所选文件" is how "知识库增加不了" became unexplainable for users.
+                message = "无法读取所选文件：${readResult.exceptionOrNull()?.message?.take(120) ?: "未知错误"}"
                 return@launch
             }
             val name = fileName.substringBeforeLast('.').ifBlank { "未命名知识库" }
@@ -163,7 +171,7 @@ fun KnowledgeBasesScreen(onBack: () -> Unit, onOpen: (String) -> Unit, modifier:
                 message = "导入失败：${it.message?.take(120) ?: "未知错误"}"
                 return@launch
             }
-        if (settings.vectorProviderMode == "third_party") {
+        if (book.indexStatus == "pending_confirm" || book.indexStatus == "partial_pending_confirm") {
                 remoteChunkCount = viewModel.planKnowledgeBaseIndex(book.id).chunkCount
                 remoteConfirm = book
         } else message = "已导入《${book.name}》，正在后台建立本地索引"
@@ -192,11 +200,11 @@ fun KnowledgeBasesScreen(onBack: () -> Unit, onOpen: (String) -> Unit, modifier:
                 value = privateCandidateLimit.toFloat(),
                 onValueChange = { privateCandidateLimit = (it / 50f).toInt() * 50 },
                 onValueChangeFinished = { settings.knowledgeBasePrivateCandidateLimit = privateCandidateLimit },
-                valueRange = 100f..1000f,
-                steps = 17,
+                valueRange = 100f..(com.rhodes.privatechat.shared.knowledge.KnowledgeBaseTextProcessor.MAX_CHUNKS.toFloat()),
+                steps = 33,
                 colors = SliderDefaults.colors(thumbColor = Primary, activeTrackColor = Primary),
             )
-            Text("当前单本知识库最多 500 个分段；设置为 500 或更高时，会比较该知识库的全部有效分段。", fontSize = 11.sp, color = TextSecondary)
+            Text("当前单本知识库最多 ${com.rhodes.privatechat.shared.knowledge.KnowledgeBaseTextProcessor.MAX_CHUNKS} 个分段；设置为该值时，会比较该知识库的全部有效分段。", fontSize = 11.sp, color = TextSecondary)
             Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { creating = true }, modifier = Modifier.weight(1f)) { Text("新建知识库") }
                 Button(onClick = { importer.launch(arrayOf("text/plain", "text/markdown", "text/*")) }, modifier = Modifier.weight(1f)) { Text("导入 TXT / MD") }
@@ -227,12 +235,21 @@ fun KnowledgeBasesScreen(onBack: () -> Unit, onOpen: (String) -> Unit, modifier:
         onSave = { name, content ->
             if (saving) return@KnowledgeBaseTextDialog
             saving = true
+            // Same class of bug as the persona editor: this dialog's save button is gated on `saving`, so a
+            // save that never returns leaves the button disabled and the dialog stuck. Release it on a timer.
+            val kbHandler = android.os.Handler(android.os.Looper.getMainLooper())
+            val kbWatchdog = Runnable {
+                if (saving) { saving = false; message = "保存结果未返回，请返回列表确认是否已保存" }
+            }
+            kbHandler.postDelayed(kbWatchdog, 8_000L)
             scope.launch {
                 val book = runCatching { viewModel.saveKnowledgeBaseTextInBackground(name, content) }.getOrElse {
+                    kbHandler.removeCallbacks(kbWatchdog)
                     message = "保存失败：${it.message?.take(120) ?: "未知错误"}"
                     saving = false
                     return@launch
                 }
+                kbHandler.removeCallbacks(kbWatchdog)
                 creating = false
                 saving = false
                 message = "已保存《${book.name}》，正在后台分段"

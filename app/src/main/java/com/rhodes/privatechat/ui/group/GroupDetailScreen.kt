@@ -298,6 +298,16 @@ fun GroupDetailScreen(viewModel: MainViewModel, groupName: String, onBack: () ->
                         TextButton(onClick = { pendingImageUri = "" }) { Text("移除", color = ErrorRed) }
                     }
                 }
+                // The send button is disabled while a save is in flight. Without this hint the user
+                // taps a greyed-out button and sees nothing happen at all.
+                if (messageSaving) {
+                    Text(
+                        "正在发送，请稍候…",
+                        fontSize = 11.sp,
+                        color = TextSecondary,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+                    )
+                }
                 ChatInputBar(
                     text = inputText,
                     onTextChange = { inputText = it },

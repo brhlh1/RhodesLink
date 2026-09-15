@@ -183,6 +183,24 @@ fun DebugLogScreen(onBack: () -> Unit) {
                     Text("记录完整模型请求和返回", fontSize = 11.sp, color = TextSecondary, modifier = Modifier.weight(1f))
                     Switch(checked = payloadsEnabled, enabled = loggingEnabled, onCheckedChange = { payloadsEnabled = it; settings.debugLogPayloadsEnabled = it; DebugLogger.allowSensitiveTrace = loggingEnabled && it })
                 }
+                var plainSettingsMode by remember {
+                    mutableStateOf(context.getSharedPreferences("rhodes_settings", android.content.Context.MODE_PRIVATE).getBoolean("diagnostic_use_plain_settings", false))
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text("诊断：设置改用明文存储", fontSize = 11.sp, color = TextSecondary)
+                        Text(
+                            if (plainSettingsMode) "已开启，请完全退出并重开 App。若此时「发送后有回复了」，就证明加密设置库是卡死原因（可先这样用着）。"
+                            else "排查「发送后一直没回复」用。开启后必须完全退出并重新打开 App 才生效。",
+                            fontSize = 10.sp, color = if (plainSettingsMode) AccentOrange else TextSecondary
+                        )
+                    }
+                    Switch(checked = plainSettingsMode, onCheckedChange = { on ->
+                        plainSettingsMode = on
+                        context.getSharedPreferences("rhodes_settings", android.content.Context.MODE_PRIVATE).edit()
+                            .putBoolean("diagnostic_use_plain_settings", on).commit()
+                    })
+                }
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
                     TextButton(onClick = {
                         val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)

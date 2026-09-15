@@ -398,7 +398,7 @@ class AIService(private val client: HttpClient = createHttpClient()) {
             }
             if (!response.status.isSuccess()) {
                 val detail = response.bodyAsText().trim().replace(Regex("\\s+"), " ").take(1000)
-                throw Exception("API error ${response.status.value}${if (detail.isBlank()) "" else ": $detail"}")
+                throw Exception("API error ${response.status.value}: ${ModelErrorMessages.forHttpStatus(response.status.value, detail)}")
             }
             val responseBody = response.bodyAsText()
             val completion = json.decodeFromString<NonStreamResponse>(responseBody)
@@ -469,7 +469,7 @@ class AIService(private val client: HttpClient = createHttpClient()) {
             val responseBody = response.bodyAsText()
             if (!response.status.isSuccess()) {
                 val detail = responseBody.trim().replace(Regex("\\s+"), " ").take(1000)
-                throw Exception("Anthropic API error ${response.status.value}${if (detail.isBlank()) "" else ": $detail"}")
+                throw Exception("Anthropic API error ${response.status.value}: ${ModelErrorMessages.forHttpStatus(response.status.value, detail)}")
             }
             val root = json.parseToJsonElement(responseBody).jsonObject
             val content = (root["content"] as? JsonArray).orEmpty()
@@ -521,7 +521,7 @@ class AIService(private val client: HttpClient = createHttpClient()) {
             }
             if (!response.status.isSuccess()) {
                 val detail = response.bodyAsText().trim().replace(Regex("\\s+"), " ").take(1000)
-                throw Exception("Google API error ${response.status.value}${if (detail.isBlank()) "" else ": $detail"}")
+                throw Exception("Google API error ${response.status.value}: ${ModelErrorMessages.forHttpStatus(response.status.value, detail)}")
             }
             val responseBody = response.bodyAsText()
             val googleResp = json.decodeFromString<GoogleGenerateResponse>(responseBody)

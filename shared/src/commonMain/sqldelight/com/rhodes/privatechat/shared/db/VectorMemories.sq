@@ -135,3 +135,6 @@ WHERE id IN (
 
 deleteAllVectorMemories:
 DELETE FROM vector_memories;
+
+deleteVectorMemoriesByOwnerTypes:
+DELETE FROM vector_memories WHERE ownerType IN (?, ?, ?);

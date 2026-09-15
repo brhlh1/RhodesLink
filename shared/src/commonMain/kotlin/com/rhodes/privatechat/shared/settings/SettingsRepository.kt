@@ -1016,8 +1016,12 @@ class SettingsRepository(private val settings: ObservableSettings) {
 
     /** Maximum vector candidates compared per knowledge base during private-chat retrieval. */
     var knowledgeBasePrivateCandidateLimit: Int
-        get() = getInt("knowledge_base_private_candidate_limit", 100).coerceIn(100, 1_000)
-        set(value) = putInt("knowledge_base_private_candidate_limit", value.coerceIn(100, 1_000))
+        get() = getInt("knowledge_base_private_candidate_limit", 100)
+            .coerceIn(100, com.rhodes.privatechat.shared.knowledge.KnowledgeBaseTextProcessor.MAX_CHUNKS)
+        set(value) = putInt(
+            "knowledge_base_private_candidate_limit",
+            value.coerceIn(100, com.rhodes.privatechat.shared.knowledge.KnowledgeBaseTextProcessor.MAX_CHUNKS)
+        )
 
     var commentMinChars: Int
         get() = getInt("comment_min_chars", 10).coerceAtLeast(0)

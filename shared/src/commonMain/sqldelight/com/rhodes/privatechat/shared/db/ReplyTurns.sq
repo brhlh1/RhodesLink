@@ -66,3 +66,45 @@ DELETE FROM reply_turns WHERE sessionId = ?;
 
 deleteAllReplyTurns:
 DELETE FROM reply_turns;
+
+deleteReplyTurnsBySourceMessageId:
+DELETE FROM reply_turns WHERE sourceMessageId = ?;
+
+countOrphanedSucceededReplyTurns:
+SELECT COUNT(*) FROM reply_turns
+WHERE sourceMessageId IS NOT NULL
+  AND status = 'succeeded'
+  AND NOT EXISTS (
+      SELECT 1 FROM chat_messages m
+      WHERE m.id = reply_turns.sourceMessageId AND m.sessionId = reply_turns.sessionId
+  );
+
+deleteOrphanedSucceededReplyTurns:
+DELETE FROM reply_turns
+WHERE sourceMessageId IS NOT NULL
+  AND status = 'succeeded'
+  AND NOT EXISTS (
+      SELECT 1 FROM chat_messages m
+      WHERE m.id = reply_turns.sourceMessageId AND m.sessionId = reply_turns.sessionId
+  );
+
+-- Terminal state for a turn whose message was folded into another turn (merged batch) or whose send
+-- was superseded. Every other query already ignores unknown states, so 'cancelled' can never be
+-- claimed, re-armed by the startup reconcile, or reported as an orphan.
+cancelReplyTurn:
+UPDATE reply_turns SET status = 'cancelled', leaseToken = '', leaseUntil = 0, updatedAt = ?, lastError = ?
+WHERE id = ? AND status IN ('pending', 'failed', 'running');
+
+-- Turns a killed process left behind: the compensation worker is only enqueued while a send is in
+-- flight, so after a crash nothing ever retries them and the user's message stays unanswered.
+-- Manual turns only, and only recent ones, so this can never resurrect an old conversation.
+selectRetryableReplyTurns:
+SELECT id FROM reply_turns
+WHERE triggerKind = 'manual'
+  AND status IN ('pending', 'failed', 'running')
+  AND createdAt >= :since
+  AND nextAttemptAt <= :now
+  AND (status != 'running' OR leaseUntil <= :now)
+ORDER BY createdAt ASC
+LIMIT :limit;
+

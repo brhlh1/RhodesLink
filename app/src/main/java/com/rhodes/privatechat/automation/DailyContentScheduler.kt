@@ -40,10 +40,19 @@ object DailyContentScheduler {
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(PLAN_WORK, ExistingPeriodicWorkPolicy.UPDATE, request)
     }
 
-    fun ensureTodayPlan(context: Context, repository: ChatRepository, settings: SettingsRepository) = runBlocking {
-        if (!settings.autoAiEnabled) return@runBlocking
+    fun ensureTodayPlan(context: Context, repository: ChatRepository, settings: SettingsRepository) =
+        runBlocking { ensureTodayPlanSuspending(context, repository, settings) }
+
+    /**
+     * Suspend form of the planner. The worker used to call a runBlocking wrapper, which parked a
+     * Dispatchers.Default thread inside joinBlocking. Private-chat prompt assembly reads the database
+     * through that same shared pool, so a running planner starved the very first read and the whole reply
+     * died on the 50s prompt_build timeout - proven by the thread dump taken at that timeout.
+     */
+    suspend fun ensureTodayPlanSuspending(context: Context, repository: ChatRepository, settings: SettingsRepository) {
+        if (!settings.autoAiEnabled) return
         val cycle = cycleId()
-        if (settings.getBoolean("daily_content_planned_$cycle", false)) return@runBlocking
+        if (settings.getBoolean("daily_content_planned_$cycle", false)) return
         val now = System.currentTimeMillis()
         val operators = repository.getAllOperatorsSync()
         val cycleStart = cycleStart(now)
@@ -72,7 +81,11 @@ object DailyContentScheduler {
     }
 
     /** Replaces only today's pending deliveries after the user saves new automatic-content settings. */
-    fun rebuildTodayPlan(context: Context, repository: ChatRepository, settings: SettingsRepository) = runBlocking {
+    fun rebuildTodayPlan(context: Context, repository: ChatRepository, settings: SettingsRepository) =
+        runBlocking { rebuildTodayPlanSuspending(context, repository, settings) }
+
+    /** Suspend form; also avoids the old nested runBlocking (this wrapping ensureTodayPlan). */
+    suspend fun rebuildTodayPlanSuspending(context: Context, repository: ChatRepository, settings: SettingsRepository) {
         val cycle = cycleId()
         val operators = repository.getAllOperatorsSync()
         val workManager = WorkManager.getInstance(context)
@@ -82,7 +95,7 @@ object DailyContentScheduler {
             workManager.cancelUniqueWork(workName(cycle, TYPE_PRIVATE, op.id, "0"))
         }
         settings.remove("daily_content_planned_$cycle")
-        ensureTodayPlan(context, repository, settings)
+        ensureTodayPlanSuspending(context, repository, settings)
     }
 
     /** Settings must not fail just because a best-effort background plan rebuild fails. */

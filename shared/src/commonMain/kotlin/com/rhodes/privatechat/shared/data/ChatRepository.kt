@@ -35,7 +35,7 @@ data class CoreDataRepairResult(
 class ChatRepository(private val wrapper: DatabaseWrapper, settings: SettingsRepository? = null) {
     val operators = OperatorRepository(wrapper)
     val sessions = SessionRepository(wrapper)
-    val messages = MessageRepository(wrapper)
+    val messages = MessageRepository(wrapper, settings)
     val memories = MemoryRepository(wrapper)
     val anchors = AnchorRepository(wrapper, settings)
     val relationships = RelationshipRepository(wrapper)
@@ -329,6 +329,30 @@ class ChatRepository(private val wrapper: DatabaseWrapper, settings: SettingsRep
 
     suspend fun deleteSessionMessages(sessionId: String) = messages.deleteSessionMessages(sessionId)
     suspend fun deleteMessage(id: Long) = messages.deleteMessage(id)
+    /** Drops succeeded turns whose source message no longer exists (safe derived-data cleanup). */
+    suspend fun cleanupOrphanedReplyTurns(): Long = replyTurns.cleanupOrphanedSucceededTurns()
+    suspend fun deleteReplyTurnsBySourceMessage(messageId: Long) = replyTurns.deleteBySourceMessageId(messageId)
+    suspend fun deleteReplyTurnsBySession(sessionId: String) = replyTurns.deleteBySession(sessionId)
+    /** Marks a turn terminal so it can never reply: its message belongs to another turn's batch. */
+    suspend fun cancelReplyTurn(turnId: String, error: String) = replyTurns.cancel(turnId, error)
+    /** Turns that still need a reply but lost their worker (crash / process death). */
+    suspend fun retryableReplyTurnIds(since: Long, now: Long, limit: Long = 50L): List<String> =
+        replyTurns.retryableTurnIds(since, now, limit)
+
+    /**
+     * Invalidates only the recalled-memory vector partitions. Knowledge-base vectors live in the same
+     * table but are a separate partition: wiping them left the book marked "indexed" with zero
+     * recallable content, so the character silently stopped seeing its knowledge base.
+     */
+    suspend fun clearMemoryVectorPartitions() = withContext(Dispatchers.Default) {
+        wrapper.database.vectorMemoriesQueries.deleteVectorMemoriesByOwnerTypes("operator", "group", "global")
+        wrapper.database.memoryItemsQueries.clearAllMemoryItemVectorIds()
+    }
+
+    /** Marks indexed books as pending a rebuild after an embedding change; content is never deleted. */
+    suspend fun markKnowledgeBasesNeedingReindex(now: Long = System.currentTimeMillis()) = withContext(Dispatchers.Default) {
+        wrapper.database.knowledgeBasesQueries.markKnowledgeBasesPendingReindex(now)
+    }
     suspend fun getMessageCount() = messages.getMessageCount()
     suspend fun deleteOldMessages(cutoff: Long) = messages.deleteOldMessages(cutoff)
     suspend fun getMessageCountPerSender() = messages.getMessageCountPerSender()
@@ -358,6 +382,8 @@ class ChatRepository(private val wrapper: DatabaseWrapper, settings: SettingsRep
             }
             db.chatDisplayEventsQueries.deleteSessionDisplayEvents(sessionId)
             db.chatMessagesQueries.deleteSessionMessages(sessionId)
+            // The archived messages replace the whole session, so their reply turns must go with them.
+            db.replyTurnsQueries.deleteReplyTurnsBySession(sessionId)
             db.memoriesQueries.deleteMemoriesBySession(sessionId)
             db.memoriesQueries.deleteLongTermByOperator(operatorId)
             db.memoryAnchorsQueries.deleteAnchorsBySession(sessionId)
@@ -506,6 +532,9 @@ class ChatRepository(private val wrapper: DatabaseWrapper, settings: SettingsRep
             db.memoriesQueries.deleteMemoriesBySession(sessionId)
             db.memoriesQueries.deleteLongTermByOperator(operatorId)
             db.memoryAnchorsQueries.deleteAnchorsBySession(sessionId)
+            // Erasing the relationship removes every message of this session; their turns must not stay
+            // behind as orphans (a reused message id would then silently lose its reply).
+            db.replyTurnsQueries.deleteReplyTurnsBySession(sessionId)
             db.memoryLinksQueries.deleteMemoryLinksForOwnerPrivateSource("operator", operatorId, "operator", operatorId)
             db.memoryBatchesQueries.deletePrivateMemoryBatchesByOwner("operator", operatorId)
             db.memoryItemsQueries.deletePrivateRelationshipMemoryItems("operator", operatorId)
@@ -525,6 +554,7 @@ class ChatRepository(private val wrapper: DatabaseWrapper, settings: SettingsRep
     suspend fun getAnchorCount() = anchors.getAnchorCount()
     suspend fun getAllAnchorsForBackup() = anchors.getAllAnchorsForBackup()
     suspend fun deleteOldAnchors(cutoff: Long) = anchors.deleteOldAnchors(cutoff)
+    suspend fun restoreExpiredAnchorsToPermanent(now: Long) = anchors.restoreExpiredAnchorsToPermanent(now)
     suspend fun deleteAnchorsBySession(sessionId: String) = anchors.deleteAnchorsBySession(sessionId)
     suspend fun deleteAnchorsByOperator(operatorId: String) = anchors.deleteAnchorsByOperator(operatorId)
     suspend fun enforceAnchorRetain(operatorId: String, keepCount: Int = 200) = anchors.enforceAnchorRetain(operatorId, keepCount)

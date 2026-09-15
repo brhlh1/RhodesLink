@@ -167,6 +167,20 @@ class AnchorRepository(private val wrapper: DatabaseWrapper, private val setting
             Log.e("AnchorRepository", "按会话删除锚点失败", e)
         }
     }
+
+    /**
+     * Revives anchors whose expiry lapsed while retention was still the legacy 7-day default.
+     * Only additive in effect: rows are kept, nothing is created or deleted. Emotion anchors keep the
+     * product's 7-day rule, everything else becomes permanent, matching MemoryPolicy.anchorExpiresAt.
+     */
+    suspend fun restoreExpiredAnchorsToPermanent(now: Long) = withContext(Dispatchers.Default) {
+        try {
+            db.memoryAnchorsQueries.restorePermanentAnchorExpiry(Long.MAX_VALUE, now)
+            db.memoryAnchorsQueries.restoreEmotionAnchorExpiry(now + 7L * 86_400_000L, now)
+        } catch (e: Exception) {
+            Log.e("AnchorRepository", "恢复锚点保留期失败", e)
+        }
+    }
     suspend fun deleteAnchorsByOperator(operatorId: String) = withContext(Dispatchers.Default) {
         try {
             db.memoryAnchorsQueries.deleteAnchorsByOperator(operatorId)

@@ -670,10 +670,14 @@ class SharedUtils(
     }
 
     fun contextBlockLimit(weight: Int = 1): Int {
+        // Background blocks (memory, knowledge-base recall, private-chat background) are already bounded by
+        // explicit item counts the player controls, so the character cap is a second safety net rather than
+        // the main limit. It was tight enough to truncate real content (500/900/1400), so it is raised:
+        // the persona and the rules never go through this function, and the item counts still bound growth.
         val base = when (settings.contextMode) {
-            "economy" -> 500
-            "full" -> 1400
-            else -> 900
+            "economy" -> 1_000
+            "full" -> 5_000
+            else -> 2_500
         }
         return (base * weight).coerceAtLeast(200)
     }

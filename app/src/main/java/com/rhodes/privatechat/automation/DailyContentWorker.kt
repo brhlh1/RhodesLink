@@ -21,10 +21,12 @@ class DailyContentWorker(context: Context, params: WorkerParameters) : Coroutine
             val repository = get<ChatRepository>(ChatRepository::class.java)
             val settings = get<SettingsRepository>(SettingsRepository::class.java)
             if (inputData.getString("type") == DailyContentScheduler.TYPE_PLAN) {
-                DailyContentScheduler.ensureTodayPlan(applicationContext, repository, settings)
+                // Suspend form on purpose: the runBlocking wrapper parked a shared Default thread and starved
+                // private-chat prompt assembly, which surfaced to users as "发送消息显示未送达".
+                DailyContentScheduler.ensureTodayPlanSuspending(applicationContext, repository, settings)
                 return Result.success()
             }
-            DailyContentScheduler.ensureTodayPlan(applicationContext, repository, settings)
+            DailyContentScheduler.ensureTodayPlanSuspending(applicationContext, repository, settings)
             val viewModel = MainViewModel(
                 applicationContext as Application, repository, settings,
                 get<AppStateHolder>(AppStateHolder::class.java), get<SharedUtils>(SharedUtils::class.java),

@@ -37,6 +37,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 deleteExpiredAnchors:
 DELETE FROM memory_anchors WHERE expiresAt < ?;
 
+-- Old builds defaulted anchor retention to 7 days, so every anchor written back then carries an expiry
+-- that has already lapsed. Changing the retention setting cannot revive those rows: every recall query
+-- filters on expiresAt > now, and the cleanup sweep physically deletes them. The next two statements are
+-- the one-time repair, run only while the user's anchor retention is the permanent sentinel.
+restorePermanentAnchorExpiry:
+UPDATE memory_anchors SET expiresAt = :newExpiry WHERE type != 'EMOTION' AND expiresAt < :now;
+
+-- Emotion anchors keep the product's own 7-day rule, so survivors are only pushed 7 days forward.
+restoreEmotionAnchorExpiry:
+UPDATE memory_anchors SET expiresAt = :newExpiry WHERE type = 'EMOTION' AND expiresAt < :now;
+
+
 deleteOldAnchors:
 DELETE FROM memory_anchors WHERE createdAt < ?;
 

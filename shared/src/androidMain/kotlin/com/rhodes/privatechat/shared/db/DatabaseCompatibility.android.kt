@@ -40,33 +40,51 @@ object DatabaseCompatibility {
                 val hasPartialCompatibilityArtifacts = hasPartialCompatibilityArtifacts(db)
 
                 if (userVersion < TARGET_VERSION && hasPartialCompatibilityArtifacts) {
-                    ensureCompatibilitySchema(db)
-                    if (tableExists(db, "diaries")) {
-                        db.execSQL("DROP INDEX IF EXISTS idx_diaries_operator_date")
+                    // All statements in this branch are additive (CREATE TABLE / ADD COLUMN), so they
+                    // are safe to run inside one transaction: a crash mid-way can no longer leave the
+                    // database with a half-applied compatibility schema.
+                    runAdditiveTransaction(db) {
+                        ensureCompatibilitySchema(db)
+                        if (tableExists(db, "diaries")) {
+                            db.execSQL("DROP INDEX IF EXISTS idx_diaries_operator_date")
+                        }
                     }
                     val targetVersion = if (hasFullCompatibilitySchema(db)) TARGET_VERSION else userVersion
                     db.execSQL("PRAGMA user_version = $targetVersion")
+                    if (targetVersion < TARGET_VERSION) {
+                        recordDiagnostic(
+                            context,
+                            "Database/CompatibilitySchemaIncomplete",
+                            "reported=$userVersion, target=$TARGET_VERSION, keptVersion=$targetVersion, note=核心表或兼容列缺失，交由 SQLDelight 迁移处理"
+                        )
+                    }
                 } else if (!isDerivedDataCleaned(context)) {
                     ensureOperatorsCompatibility(db)
                 }
 
                 // Older databases must let SQLDelight run its numbered migrations first; adding
                 // their columns here would make those ALTER TABLE statements fail.
-                if (userVersion >= TARGET_VERSION) {
+                // IMPORTANT: re-read the version instead of reusing the value captured above. The
+                // branch just above can advance it to TARGET_VERSION, and deciding from the stale
+                // value would skip the core-chat-schema repair for exactly those databases.
+                val effectiveUserVersion = currentUserVersion(db)
+                if (effectiveUserVersion >= TARGET_VERSION) {
                     // A prior interrupted upgrade can leave the database version advanced while
                     // its core chat tables are absent or incomplete. Repair only additive schema
                     // here; never delete rows or advance user_version.
-                    ensureCoreChatSchema(db)
-                    ensureCompatibilitySchema(db)
-                    advanceUserVersionIfSchemaComplete(db, userVersion)
+                    runAdditiveTransaction(db) {
+                        ensureCoreChatSchema(db)
+                        ensureCompatibilitySchema(db)
+                    }
+                    advanceUserVersionIfSchemaComplete(db, effectiveUserVersion)
                 }
                 normalizeLegacyMessageTimestamps(context, db)
                 val operatorCount = tableCount(db, "operators")
                 val sessionCount = tableCount(db, "chat_sessions")
                 val messageCount = tableCount(db, "chat_messages")
                 verifyUpgradeData(context, db, operatorCount, sessionCount, messageCount)
-                recordDiagnostic(context, "Database/CoreSchemaReady", "userVersion=$userVersion, operators=${existingColumns(db, "operators").size}, sessions=${existingColumns(db, "chat_sessions").size}, messages=${existingColumns(db, "chat_messages").size}, operatorCount=$operatorCount, sessionCount=$sessionCount, messageCount=$messageCount")
-                recordDiagnostic(context, "Special/DatabaseReady", "dbExists=true, userVersion=$userVersion, operatorCount=$operatorCount, sessionCount=$sessionCount, messageCount=$messageCount")
+                recordDiagnostic(context, "Database/CoreSchemaReady", "userVersion=$effectiveUserVersion, operators=${existingColumns(db, "operators").size}, sessions=${existingColumns(db, "chat_sessions").size}, messages=${existingColumns(db, "chat_messages").size}, operatorCount=$operatorCount, sessionCount=$sessionCount, messageCount=$messageCount")
+                recordDiagnostic(context, "Special/DatabaseReady", "dbExists=true, userVersion=$effectiveUserVersion, operatorCount=$operatorCount, sessionCount=$sessionCount, messageCount=$messageCount")
             }
         } catch (e: Exception) {
             Log.e(TAG, "数据库兼容准备失败: ${e.message}", e)
@@ -295,6 +313,29 @@ object DatabaseCompatibility {
         val miColumns = existingColumns(db, "memory_items")
         if ("topicKey" in miColumns) {
             db.execSQL("PRAGMA user_version = $TARGET_VERSION")
+        }
+    }
+
+    /** Reads the version that is actually stored now, instead of trusting an earlier snapshot. */
+    private fun currentUserVersion(db: SQLiteDatabase): Int = db.rawQuery("PRAGMA user_version", null).use { cursor ->
+        if (cursor.moveToFirst()) cursor.getInt(0) else 0
+    }
+
+    /**
+     * Runs additive schema repair (CREATE TABLE IF NOT EXISTS / ALTER TABLE ADD COLUMN) as one unit.
+     * Nested calls are tolerated, so this stays safe if a caller already opened a transaction.
+     */
+    private inline fun runAdditiveTransaction(db: SQLiteDatabase, block: () -> Unit) {
+        if (db.inTransaction()) {
+            block()
+            return
+        }
+        db.beginTransaction()
+        try {
+            block()
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
     }
 
@@ -648,6 +689,13 @@ object DatabaseCompatibility {
     }
 
     private fun hasFullCompatibilitySchema(db: SQLiteDatabase): Boolean {
+        // Raising user_version tells SQLDelight that migrations up to TARGET_VERSION are already
+        // applied. That is only safe when the tables those migrations operate on exist; otherwise the
+        // first migration touching a missing table throws and the database can never be opened.
+        if (!tableExists(db, "operators")) return false
+        if (!tableExists(db, "chat_sessions")) return false
+        if (!tableExists(db, "chat_messages")) return false
+        if (!tableExists(db, "diaries")) return false
         val memoryColumns = existingColumns(db, "memory_anchors")
         val operatorColumns = existingColumns(db, "operators")
         return memoryAnchorCompatibilityColumns.all { it.first in memoryColumns } &&

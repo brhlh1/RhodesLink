@@ -37,6 +37,7 @@ import com.rhodes.privatechat.shared.model.MomentLike
 import com.rhodes.privatechat.shared.model.Operator
 import com.rhodes.privatechat.util.DebugLogger
 import com.rhodes.privatechat.automation.DailyContentScheduler
+import com.rhodes.privatechat.automation.ManualReplyScheduler
 import com.rhodes.privatechat.notification.RhodesNotificationCenter
 import com.rhodes.privatechat.notification.RhodesAppVisibility
 import com.rhodes.privatechat.shared.data.SenderCount
@@ -132,6 +133,17 @@ class MainViewModel(
     companion object {
         /** 全局调试开关，上线前改为 false */
         const val DEBUG = false
+        /** Reply turns older than this are never re-armed on startup (no surprise replies to old chats). */
+        private const val REPLY_RECONCILE_WINDOW_MS = 24L * 60 * 60 * 1000
+        /**
+         * After several days away, every catch-up task (cleanup, memory-index recovery, retry queue, daily
+         * plan, per-role anchor trimming, cross-day jobs) used to fire in the same instant. That backlog
+         * blocked chat and made "save" look unresponsive. Hold the backlog back briefly so the user's first
+         * interactions get the database first.
+         */
+        private const val STARTUP_BACKLOG_DELAY_MS = 10_000L
+        /** Pace the per-role anchor trimming instead of hammering the single database lane. */
+        private const val ANCHOR_TRIM_PACING_MS = 40L
         /** 道具价格 */
         const val PROP_PRICE = 100
         /** 防止多个 ViewModel 实例并发执行自动生成 */
@@ -567,6 +579,32 @@ class MainViewModel(
                 if (recovered > 0) {
                     DebugLogger.diagnostic("Startup/RoleRecoveryVerificationNeeded", "recovered=$recovered")
                 }
+                // Derived-data repair only: drops succeeded reply turns whose source message is gone.
+                // Those orphans can block the reply of a later message that reuses the same id.
+                runCatching { repository.cleanupOrphanedReplyTurns() }
+                    .onSuccess { removed -> if (removed > 0L) DebugLogger.diagnostic("Startup/OrphanReplyTurnCleanup", "removed=$removed") }
+                    .onFailure { DebugLogger.diagnostic("Startup/OrphanReplyTurnCleanupFailed", "error=${it.javaClass.simpleName}:${it.message?.take(120)}") }
+                // P-03: a killed process leaves turns with no worker behind them, so the message stays
+                // unanswered forever. Re-arm recent manual turns once per launch; auto/group turns are
+                // owned by their own schedulers and are deliberately not touched here.
+                runCatching {
+                    val now = System.currentTimeMillis()
+                    val ids = repository.retryableReplyTurnIds(since = now - REPLY_RECONCILE_WINDOW_MS, now = now)
+                    ids.forEach { ManualReplyScheduler.scheduleTurn(application, it) }
+                    if (ids.isNotEmpty()) DebugLogger.diagnostic("Startup/ReplyTurnReconcile", "rescheduled=${ids.size}")
+                }.onFailure {
+                    DebugLogger.diagnostic("Startup/ReplyTurnReconcileFailed", "error=${it.javaClass.simpleName}:${it.message?.take(120)}")
+                }
+                // KB-05: a book left mid-chunking by a killed process keeps 正在分段 forever and is not
+                // usable, because nothing resumed it unless the user happened to open the knowledge-base
+                // list. Resume any such book once per launch.
+                runCatching {
+                    val stuck = repository.knowledgeBases.getAll().filter { it.indexStatus == "processing" }
+                    stuck.forEach { knowledgeBaseImportService?.resumeBackgroundProcessing(it) }
+                    if (stuck.isNotEmpty()) DebugLogger.diagnostic("Startup/KnowledgeBaseResume", "resumed=${stuck.size}")
+                }.onFailure {
+                    DebugLogger.diagnostic("Startup/KnowledgeBaseResumeFailed", "error=${it.javaClass.simpleName}:${it.message?.take(120)}")
+                }
                 // Remove only stale UI hide markers. Never hide a session that still exists under
                 // another ID, and never remove a database row as part of this cleanup.
                 val currentSessions = repository.getAllSessionsSync()
@@ -633,6 +671,8 @@ class MainViewModel(
         }
         // 每天执行一次自动保留期清理；启动时仍会先执行一次。
         viewModelScope.launch {
+            // Give the first user interactions a clear runway before the backlog starts (see above).
+            delay(STARTUP_BACKLOG_DELAY_MS)
             while (true) {
                 val cleanupBefore = logMemoryStartupSnapshot("before_cleanup")
                 dataViewModel.restorePermanentMemoryRetentionIfNeeded()
@@ -646,8 +686,10 @@ class MainViewModel(
                 recoverMissingMemoryIndexes(limit = 50)
                 memoryV2Pipeline.retryPendingSources(limit = 20)
                 // 每个干员保留最多 200 条锚点
+                // 每条之间留出间隔：147 个角色紧挨着跑会把单车道数据库占满，正好卡在用户刚回来时。
                 for (op in _operators.value) {
                     try { repository.enforceAnchorRetain(op.id, 200) } catch (_: Exception) { }
+                    delay(ANCHOR_TRIM_PACING_MS)
                 }
                 delay(24 * 60 * 60 * 1000L)
             }
@@ -1394,8 +1436,12 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
 
     suspend fun invalidateAllMemoryIndexes() {
         memoryIndexMaintenanceMutex.withLock {
-            memoryVectorService?.clearAllMemories()
-            repository.clearAllMemoryItemVectorIds()
+            // Only memory-owned vector partitions are dropped. Knowledge-base vectors share the same
+            // table; wiping them used to leave the book marked "indexed" with nothing left to recall.
+            runCatching { repository.clearMemoryVectorPartitions() }
+                .onFailure { DebugLogger.diagnostic("Memory/InvalidateFailed", "error=${it.javaClass.simpleName}:${it.message?.take(120)}") }
+            runCatching { repository.markKnowledgeBasesNeedingReindex() }
+                .onFailure { DebugLogger.diagnostic("KnowledgeBase/ReindexMarkFailed", "error=${it.javaClass.simpleName}:${it.message?.take(120)}") }
         }
     }
 

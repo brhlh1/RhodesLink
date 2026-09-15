@@ -8,6 +8,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
@@ -15,6 +16,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -204,7 +206,12 @@ class KnowledgeBaseIndexService(
         var failed = 0
         val errors = mutableListOf<String>()
         chunks.forEachIndexed { index, chunk ->
-            if (isCancelled(knowledgeBaseId) || repository.get(knowledgeBaseId) == null) return@withLock KnowledgeBaseIndexResult(knowledgeBaseId, chunks.size, succeeded, failed)
+            if (isCancelled(knowledgeBaseId) || repository.get(knowledgeBaseId) == null) {
+                // Leaving the status at "indexing:x/y" made the book unusable forever: the UI only offers
+                // resume/retry paths for pending/partial states.
+                repairStatusAfterInterruption(knowledgeBaseId)
+                return@withLock KnowledgeBaseIndexResult(knowledgeBaseId, chunks.size, succeeded, failed)
+            }
             try {
                 val searchableContent = buildSearchableContent(book.name, chunk.sourceHeading, chunk.userKeywords, chunk.content)
                 saveChunkVector(
@@ -236,11 +243,45 @@ class KnowledgeBaseIndexService(
         repository.updateIndexStatus(knowledgeBaseId, status, signature)
         KnowledgeBaseIndexResult(knowledgeBaseId, chunks.size, succeeded, failed, errors.distinct().take(5))
         } catch (cancelled: CancellationException) {
-            repository.updateIndexStatus(knowledgeBaseId, "pending")
+            // A cancelled scope cannot write to the database: withContext re-checks cancellation on entry,
+            // so this repair used to be a silent no-op and the book stayed at "indexing:x/y" forever.
+            // NonCancellable is required for the write to happen at all.
+            repairStatusAfterInterruption(knowledgeBaseId)
             throw cancelled
         } catch (error: Throwable) {
-            repository.get(knowledgeBaseId)?.let { repository.updateIndexStatus(knowledgeBaseId, "failed") }
+            repository.get(knowledgeBaseId)?.let { current ->
+                // Keep the previously indexed state usable: clearing the signature (the old default "") or
+                // downgrading to "failed" hid chunks whose vectors are still present, so a single failed
+                // re-index silently disabled a book that had been working.
+                val usableChunks = repository.getChunks(knowledgeBaseId)
+                    .any { it.enabled && it.indexedAt > 0L && it.indexError.isBlank() }
+                repository.updateIndexStatus(
+                    knowledgeBaseId,
+                    if (usableChunks) "partial_failed" else "failed",
+                    current.indexedEmbeddingSignature,
+                )
+            }
             throw error
+        }
+    }
+
+    /**
+     * Status a cancelled or interrupted run leaves behind, so an interrupted book is never stuck at
+     * "indexing:x/y". Runs non-cancellable because the caller is usually already cancelled.
+     */
+    private suspend fun repairStatusAfterInterruption(knowledgeBaseId: String) {
+        withContext(NonCancellable + Dispatchers.Default) {
+            runCatching {
+                val current = repository.get(knowledgeBaseId) ?: return@runCatching
+                if (!current.indexStatus.startsWith("indexing") && !current.indexStatus.startsWith("partial_indexing")) return@runCatching
+                val usableChunks = repository.getChunks(knowledgeBaseId)
+                    .any { it.enabled && it.indexedAt > 0L && it.indexError.isBlank() }
+                repository.updateIndexStatus(
+                    knowledgeBaseId,
+                    if (usableChunks) "partial_pending_confirm" else "pending",
+                    current.indexedEmbeddingSignature,
+                )
+            }
         }
     }
 

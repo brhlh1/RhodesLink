@@ -2,6 +2,7 @@ package com.rhodes.privatechat.settings
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.rhodes.privatechat.util.DebugLogger
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -16,9 +17,92 @@ object SettingsMigration {
     private const val MIGRATION_FIX_V2_KEY = "prefs_migration_fix_v2"
     private const val CONTINUITY_OPTIMIZATIONS_INITIALIZED_KEY = "continuity_optimizations_initialized_v1"
     private const val FRESH_INSTALL_KEY = "fresh_install_v1"
+    private const val LEGACY_SHORT_RETENTION_FIX_KEY = "legacy_short_retention_fix_v1"
+    private const val LEGACY_MESSAGE_RETENTION_FIX_KEY = "legacy_message_retention_fix_v1"
     private val legacyPreferenceFiles = listOf(
         "chat_prefs", "model_prefs", "user_prefs", "session_hidden", "token_stats", "op_perms",
         "dispatch", "op_lmb", "moment_prefs", "mahjong_history", "prompt_templates"
+    )
+
+    /**
+     * Old builds defaulted anchor/moment retention to 7 days and persisted that number, so an upgrade
+     * silently started deleting memory anchors and 动态 records older than a week on every launch.
+     * Users report that as "记忆突然消失 / 动态没了".
+     *
+     * This one-time repair only ever *reduces* deletion: it rewrites the exact legacy default (7 days)
+     * to the permanent sentinel (-1) for those two keys. The flag makes it run once, so a day count the
+     * user picks afterwards — including 7 again — is never rewritten a second time.
+     */
+    private fun restoreLegacyShortRetentionIfNeeded(context: Context) {
+        val target = context.getSharedPreferences(TARGET_SP, Context.MODE_PRIVATE)
+        if (safeBoolean(target, LEGACY_SHORT_RETENTION_FIX_KEY, false)) return
+        val editor = target.edit()
+        val repaired = mutableListOf<String>()
+        for (key in listOf("clean_days_anchors", "clean_days_moments")) {
+            // 7 was the legacy default for exactly these two keys.
+            if (storedInt(target, key) == LEGACY_SHORT_RETENTION_DAYS) {
+                editor.putInt(key, -1)
+                repaired += key
+            }
+        }
+        editor.putBoolean(LEGACY_SHORT_RETENTION_FIX_KEY, true)
+        editor.commit()
+        if (repaired.isNotEmpty()) {
+            DebugLogger.diagnostic(
+                "Settings/LegacyRetentionRepair",
+                "restored=${repaired.joinToString(",")}, from=${LEGACY_SHORT_RETENTION_DAYS}, to=-1"
+            )
+        }
+    }
+
+    /**
+     * Old builds also defaulted chat-message retention to 30 days and persisted that number, so the daily
+     * cleanup silently deleted every message older than a month - users report "聊天记录少了一段".
+     *
+     * One-time repair for that exact legacy default: it becomes the permanent sentinel. Only reduces
+     * deletion, and a day count the user chooses afterwards is never rewritten because of the flag.
+     */
+    private fun restoreLegacyMessageRetentionIfNeeded(context: Context) {
+        val target = context.getSharedPreferences(TARGET_SP, Context.MODE_PRIVATE)
+        if (safeBoolean(target, LEGACY_MESSAGE_RETENTION_FIX_KEY, false)) return
+        val editor = target.edit()
+        val repaired = mutableListOf<String>()
+        // 30 was the legacy default for chat messages, diaries and dispatch records; all three were
+        // hard-deleted by the daily cleanup. Only ever reduces deletion, and the flag makes this a
+        // one-time pass so any day count the user picks afterwards is never rewritten.
+        for (key in THIRTY_DAY_RETENTION_KEYS) {
+            if (storedInt(target, key) == LEGACY_MESSAGE_RETENTION_DAYS) {
+                editor.putInt(key, -1)
+                repaired += key
+            }
+        }
+        editor.putBoolean(LEGACY_MESSAGE_RETENTION_FIX_KEY, true)
+        editor.commit()
+        if (repaired.isNotEmpty()) {
+            DebugLogger.diagnostic(
+                "Settings/LegacyMessageRetentionRepair",
+                "restored=${repaired.joinToString(",")}, from=$LEGACY_MESSAGE_RETENTION_DAYS, to=-1"
+            )
+        }
+    }
+
+    /** Reads an int-ish setting without caring whether it was stored as Int, Long or String. */
+    private fun storedInt(prefs: SharedPreferences, key: String): Int? = when (val raw = prefs.all[key]) {
+        is Int -> raw
+        is Long -> raw.toInt()
+        is String -> raw.toIntOrNull()
+        else -> null
+    }
+
+    private fun restoreLegacyRetentionIfNeeded(context: Context) {
+        restoreLegacyShortRetentionIfNeeded(context)
+        restoreLegacyMessageRetentionIfNeeded(context)
+    }
+
+    private const val LEGACY_SHORT_RETENTION_DAYS = 7
+    private const val LEGACY_MESSAGE_RETENTION_DAYS = 30
+    private val THIRTY_DAY_RETENTION_KEYS = listOf(
+        "clean_days_messages", "clean_days_diaries", "clean_days_dispatches",
     )
 
     private fun initializeContinuityOptimizations(context: Context, target: SharedPreferences) {
@@ -55,6 +139,14 @@ object SettingsMigration {
     )
 
     fun migrateIfNeeded(context: Context) {
+        migratePreferencesIfNeeded(context)
+        // Retention repairs must run AFTER the prefs migration: on an old install the legacy day counts
+        // still live in chat_prefs and only reach rhodes_settings during the migration above.
+        // They are idempotent and flag-guarded, so running them on every launch is safe.
+        restoreLegacyRetentionIfNeeded(context)
+    }
+
+    private fun migratePreferencesIfNeeded(context: Context) {
         val target = context.getSharedPreferences(TARGET_SP, Context.MODE_PRIVATE)
         if (safeBoolean(target, MIGRATION_DONE_KEY, false)) {
             runFixV2IfNeeded(context, target)

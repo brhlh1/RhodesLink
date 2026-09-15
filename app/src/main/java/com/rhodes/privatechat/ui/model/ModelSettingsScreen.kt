@@ -36,6 +36,7 @@ import com.rhodes.privatechat.shared.voice.TtsRequest
 import com.rhodes.privatechat.shared.voice.createTtsGateway
 import com.rhodes.privatechat.shared.voice.defaultTtsVoiceId
 import com.rhodes.privatechat.shared.voice.AsrRequest
+import com.rhodes.privatechat.shared.voice.asrKeyFallbackHint
 import com.rhodes.privatechat.shared.voice.createAsrGateway
 import com.rhodes.privatechat.shared.vector.testEmbeddingGateway
 import com.rhodes.privatechat.shared.vector.MemoryVectorService
@@ -440,6 +441,10 @@ fun ModelSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 LabeledField("模型配置") { TextInput(asrModelName, { asrModelName = it }, ctx, placeholder = "realtime|transcription") }
                 Spacer(Modifier.height(10.dp))
                 LabeledField("API Key（空则复用聊天 API Key）") { SecretInput(asrApiKey, { asrApiKey = it }, ctx) }
+                asrKeyFallbackHint(asrBaseUrl.trim(), asrApiKey.trim(), apiKey.trim(), currentProviderId, asrProvider)?.let { hint ->
+                    Spacer(Modifier.height(6.dp))
+                    Text(hint, fontSize = 12.sp, color = if (hint.contains("401")) ErrorRed else TextSecondary)
+                }
                 TestButton("测试语音识别", testing == "asr", asrTestResult, onClick = ::testAsr)
             }
 

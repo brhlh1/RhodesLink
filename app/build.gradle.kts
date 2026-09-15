@@ -1,4 +1,4 @@
-import java.util.Properties
+﻿import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -29,8 +29,8 @@ android {
         applicationId = "com.buzidongshouhuoji.privatechat"
         minSdk = 26
         targetSdk = 35
-        versionCode = 37
-        versionName = "1.14.7"
+        versionCode = 47
+        versionName = "1.14.10"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

@@ -4,6 +4,7 @@ import com.rhodes.privatechat.shared.db.DatabaseWrapper
 import com.rhodes.privatechat.shared.db.DatabaseDispatcher
 import com.rhodes.privatechat.shared.db.RhodesDatabase
 import com.rhodes.privatechat.shared.model.*
+import com.rhodes.privatechat.shared.settings.SettingsRepository
 import kotlinx.coroutines.Dispatchers
 import app.cash.sqldelight.coroutines.asFlow
 import app.cash.sqldelight.coroutines.mapToList
@@ -21,6 +22,12 @@ data class ChatDisplayEvent(
     val revealOrder: Long,
 )
 
+/**
+ * 2000-01-01. Messages below this are not old data but invalid data (the schema default is 0 and the
+ * legacy repair can write 1970-era values), so retention deletion must never treat them as expired.
+ */
+private const val SANE_TIMESTAMP_FLOOR_MS = 946_684_800_000L
+
 @Serializable
 data class BackupChatDisplayEvent(
     val messageId: Long,
@@ -29,7 +36,10 @@ data class BackupChatDisplayEvent(
     val revealOrder: Long,
 )
 
-class MessageRepository(private val wrapper: DatabaseWrapper) {
+class MessageRepository(
+    private val wrapper: DatabaseWrapper,
+    private val settings: SettingsRepository? = null,
+) {
 
     private val db: RhodesDatabase get() = wrapper.database
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -191,6 +201,7 @@ class MessageRepository(private val wrapper: DatabaseWrapper) {
     /** Restores backups without allowing an old row ID to overwrite newer local content. */
     suspend fun restoreMessage(message: ChatMessage) = idMutex.withLock { withContext(DatabaseDispatcher.dispatcher) {
         nextMessageId = maxOf(nextMessageId ?: 0L, message.id + 1)
+        rememberMaxUsedMessageId(message.id)
         val ts = if (message.timestamp > 0) message.timestamp else Clock.System.now().toEpochMilliseconds()
         db.chatMessagesQueries.insertMessageIfAbsent(
             message.id, message.sessionId, message.senderId, message.senderName, message.content,
@@ -231,10 +242,24 @@ class MessageRepository(private val wrapper: DatabaseWrapper) {
         if (giftName.isBlank()) "[送出了礼物]" else "[送出了礼物：${giftName.take(30)}]"
     }.getOrDefault("[送出了礼物]")
 
+    /**
+     * Highest id ever handed out, persisted outside the database. Without it, deleting the newest rows
+     * (recall / archive load / erase) makes `MAX(id) + 1` rewind after a restart, so a new message can
+     * reuse an id whose reply_turns row still exists - which silently blocks its reply.
+     */
+    private fun persistedMaxUsedMessageId(): Long = settings?.getLong("max_used_message_id", 0L) ?: 0L
+
+    private fun rememberMaxUsedMessageId(id: Long) {
+        if (id > persistedMaxUsedMessageId()) settings?.putLong("max_used_message_id", id)
+    }
+
     suspend fun getNextMessageId(): Long = idMutex.withLock {
         DatabaseDispatcher.execute("message_allocate_id") {
-            val next = nextMessageId ?: ((db.chatMessagesQueries.getMaxId().executeAsOne().MAX ?: 0) + 1)
+            val fromDatabase = (db.chatMessagesQueries.getMaxId().executeAsOne().MAX ?: 0L) + 1
+            val fromPersisted = persistedMaxUsedMessageId() + 1
+            val next = maxOf(nextMessageId ?: 0L, fromDatabase, fromPersisted)
             nextMessageId = next + 1
+            rememberMaxUsedMessageId(next)
             next
         }
     }
@@ -242,6 +267,8 @@ class MessageRepository(private val wrapper: DatabaseWrapper) {
     suspend fun deleteSessionMessages(sessionId: String) = withContext(DatabaseDispatcher.dispatcher) {
         db.chatDisplayEventsQueries.deleteSessionDisplayEvents(sessionId)
         db.chatMessagesQueries.deleteSessionMessages(sessionId)
+        // Turns without their source messages are orphans and can block a reused message id later.
+        db.replyTurnsQueries.deleteReplyTurnsBySession(sessionId)
     }
 
     suspend fun clearSessionPreview(sessionId: String, timestamp: Long = Clock.System.now().toEpochMilliseconds()) = withContext(DatabaseDispatcher.dispatcher) {
@@ -251,10 +278,13 @@ class MessageRepository(private val wrapper: DatabaseWrapper) {
     suspend fun deleteMessage(id: Long) = withContext(DatabaseDispatcher.dispatcher) {
         db.chatDisplayEventsQueries.deleteMessageDisplayEvents(id)
         db.chatMessagesQueries.deleteMessage(id)
+        // Keep reply_turns in sync with the message rows it points at, otherwise the orphaned turn can
+        // reject the lease of a later message that reuses this id.
+        db.replyTurnsQueries.deleteReplyTurnsBySourceMessageId(id)
     }
     suspend fun deleteOldMessages(cutoff: Long) = withContext(DatabaseDispatcher.dispatcher) {
         db.chatDisplayEventsQueries.deleteOldDisplayEvents(cutoff)
-        db.chatMessagesQueries.deleteOldMessages(cutoff)
+        db.chatMessagesQueries.deleteOldMessages(cutoff, SANE_TIMESTAMP_FLOOR_MS)
     }
     suspend fun getMessageCount(): Int = withContext(DatabaseDispatcher.dispatcher) { db.chatMessagesQueries.getMessageCount().executeAsOne().toInt() }
 

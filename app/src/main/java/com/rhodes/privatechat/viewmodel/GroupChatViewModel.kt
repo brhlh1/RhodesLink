@@ -99,6 +99,8 @@ class GroupChatViewModel(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val knowledgeBaseContextBuilder: KnowledgeBaseContextBuilder? = try { org.koin.core.context.GlobalContext.get().get() } catch (_: Exception) { null }
     companion object {
+        /** A due-in-the-past auto-chat plan must not turn the scheduler loop into a hot spin. */
+        private const val MIN_AUTO_LOOP_DELAY_MS = 1_000L
         const val DEBUG = false
         private const val CHAT_PAGE_SIZE = 50L
         private const val MAX_MERGED_USER_MESSAGES = 2
@@ -209,13 +211,24 @@ class GroupChatViewModel(
         _groupMessages.value = emptyList()
         _hasMoreGroupMessages.value = true
         groupMessagesJob = scope.launch {
+            // The live flow subscription must survive a failed one-shot history read. Previously both
+            // lived in one try block, so a single database hiccup skipped the collect() entirely and
+            // left the group chat permanently blank until the user re-entered the screen.
             try {
                 val initialMessages = repository.getRecentMessagesSync(groupSessionId, pageSize)
                 if (_currentGroupId.value != groupSessionId) return@launch
                 mergeGroupMessagesFromDatabase(initialMessages)
                 DebugLogger.diagnostic("GroupChat/InitialMessagesLoaded", "groupId=$groupSessionId, count=${initialMessages.size}")
-                    repository.getRecentMessages(groupSessionId, pageSize).collect { msgs ->
-                        if (_currentGroupId.value != groupSessionId) return@collect
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                ChatTrace.d("GroupVM", "initial.CANCEL group=$groupSessionId")
+                return@launch
+            } catch (e: Exception) {
+                ChatTrace.e("GroupVM", "initial.ERROR group=$groupSessionId err=${e.message}", e)
+                DebugLogger.diagnostic("GroupChat/InitialMessagesFailed", "groupId=$groupSessionId, error=${e.javaClass.simpleName}:${e.message?.take(120)}")
+            }
+            try {
+                repository.getRecentMessages(groupSessionId, pageSize).collect { msgs ->
+                    if (_currentGroupId.value != groupSessionId) return@collect
                     ChatTrace.d("GroupVM", "flow group=$groupSessionId count=${msgs.size}")
                     mergeGroupMessagesFromFlow(msgs)
                 }
@@ -418,6 +431,10 @@ class GroupChatViewModel(
         if (_currentGroupId.value == groupId) _groupRestartAt.value = now
         restartCleanupJobs[groupId]?.cancel()
         restartCleanupJobs[groupId] = scope.launch {
+            // G-05: turns that were in flight before the restart must not write their reply into the new
+            // timeline. purgeSessionData did this for group deletion; a plain restart skipped it.
+            runCatching { repository.deleteReplyTurnsBySession(groupId) }
+                .onFailure { ChatTrace.e("GroupVM", "restart.turnCleanup.FAIL group=$groupId err=${it.message}", it) }
             repository.deleteShortTermMemory(groupId)
             repository.clearGroupRestartMemory(groupId)
             repository.sendMessage(groupId, ChatMessage(
@@ -518,7 +535,10 @@ class GroupChatViewModel(
                     }
                     val plan = GroupAutoChatScheduler.ensurePlan(context, settings, groupId) ?: break
                     if (plan.dueAt < 0L) { delay(250); continue }
-                    delay((plan.dueAt - System.currentTimeMillis()).coerceAtLeast(0L))
+                    // When the plan is already due (for example because the previous turn overran, or the
+                    // turn's lease is still held), a plain coerceAtLeast(0) made this loop spin as fast as
+                    // the DB allowed for up to five minutes. Keep a floor so it polls instead of spinning.
+                    delay((plan.dueAt - System.currentTimeMillis()).coerceAtLeast(MIN_AUTO_LOOP_DELAY_MS))
                     if (autoChatGenerations[groupId] != generation) break
                     runScheduledAutoTurn(groupId, plan.token, generation, plan.revision)
                 }
@@ -696,17 +716,25 @@ class GroupChatViewModel(
                 runCatching { unhideSession(groupSessionId) }
                     .onFailure { DebugLogger.diagnostic("GroupChat/UnhideFailed", "groupId=$groupSessionId, error=${it.javaClass.simpleName}:${it.message?.take(120)}") }
             }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                // A write timeout IS a CancellationException, so it must be handled before the
+                // cancellation branch below. Otherwise the user message stays in the input box with
+                // no bubble, no marker and no explanation at all (the reported "点击发送没反应").
+                DebugLogger.diagnostic("GroupChat/UserMessageWriteFailed", "attempt=$sendAttemptId,groupId=$groupSessionId,stage=save_failed,timeout=true,error=${e.javaClass.simpleName}:${e.message?.take(160)}")
+                failureSnapshot("user_message_write_timeout", e)
+                DebugLogger.finishOperation(debugRoundId, "失败", "群消息保存超时")
+                _lastSendError.value = "群消息保存超时，请稍后重试"
+                onResponseComplete(false)
+                return@launch
             } catch (e: kotlinx.coroutines.CancellationException) {
                 DebugLogger.finishOperation(debugRoundId, "失败", "群消息保存已取消")
                 onResponseComplete(false)
                 throw e
             } catch (e: Exception) {
-                val timeout = e is kotlinx.coroutines.TimeoutCancellationException
-                val error = if (timeout) "群消息保存超时，请稍后重试" else "群消息保存失败，请重试"
-                DebugLogger.diagnostic("GroupChat/UserMessageWriteFailed", "attempt=$sendAttemptId,groupId=$groupSessionId,stage=save_failed,timeout=$timeout,error=${e.javaClass.simpleName}:${e.message?.take(160)}")
+                DebugLogger.diagnostic("GroupChat/UserMessageWriteFailed", "attempt=$sendAttemptId,groupId=$groupSessionId,stage=save_failed,timeout=false,error=${e.javaClass.simpleName}:${e.message?.take(160)}")
                 failureSnapshot("user_message_write_failed", e)
-                DebugLogger.finishOperation(debugRoundId, "失败", if (timeout) "群消息保存超时" else "群消息保存失败：${e.javaClass.simpleName}")
-                _lastSendError.value = error
+                DebugLogger.finishOperation(debugRoundId, "失败", "群消息保存失败：${e.javaClass.simpleName}")
+                _lastSendError.value = "群消息保存失败，请重试"
                 onResponseComplete(false)
                 return@launch
             }
@@ -745,9 +773,24 @@ class GroupChatViewModel(
                     // In that case there is no text row to merge, but the supplied prompt must
                     // still reach the model.
                     val pendingIds = pendingUserMessageIds[groupSessionId].orEmpty()
-                    if (userMessageId !in pendingIds) return@launch
+                    if (userMessageId !in pendingIds) {
+                        // This message was folded into another turn's batch (or the send was cancelled).
+                        // Its own turn was already claimed above, and the finally block below would have
+                        // RELEASED it back to pending, so the recovery worker answered the same user
+                        // message a second time ~5 minutes later (G-02). 'cancelled' is terminal and every
+                        // claim/reconcile query already ignores it.
+                        DebugLogger.diagnostic("GroupChat/MergedTurnCancelled", "groupId=$groupSessionId, messageId=$userMessageId, turnId=$replyTurnId, reason=not_pending")
+                        runCatching { repository.cancelReplyTurn(replyTurnId, "merged_into_batch") }
+                        runCatching { com.rhodes.privatechat.automation.ManualReplyScheduler.completeTurn(context, replyTurnId) }
+                        return@launch
+                    }
                     val candidateIds = pendingIds.sorted().take(MAX_MERGED_USER_MESSAGES)
-                    if (candidateIds.firstOrNull() != userMessageId) return@launch
+                    if (candidateIds.firstOrNull() != userMessageId) {
+                        DebugLogger.diagnostic("GroupChat/MergedTurnCancelled", "groupId=$groupSessionId, messageId=$userMessageId, turnId=$replyTurnId, reason=owned_by_earlier_message")
+                        runCatching { repository.cancelReplyTurn(replyTurnId, "merged_into_batch") }
+                        runCatching { com.rhodes.privatechat.automation.ManualReplyScheduler.completeTurn(context, replyTurnId) }
+                        return@launch
+                    }
                     val batch = repository.getMessagesSync(groupSessionId)
                         .asSequence()
                         .filter { it.isMe && it.type == "text" && it.mode == mode }
@@ -851,7 +894,24 @@ class GroupChatViewModel(
 
                 // 全员禁言时直接返回，不调用 AI
                 if (activeMembers.isEmpty()) {
-                    _lastSendError.value = if (members.isEmpty()) "群成员资料尚未同步，请返回群列表后重新进入再发送" else "所有群成员已被禁言，无法回复"
+                    if (members.isEmpty()) {
+                        // No member profile could be resolved: that is a transient read/sync problem, not a
+                        // mute rule. Completing the turn here used to answer the user with a bogus
+                        // "所有成员已被禁言" system line and burn the turn, so the group never replied at all.
+                        _lastSendError.value = "群成员资料尚未同步，请稍后重试"
+                        DebugLogger.diagnostic("GroupChat/MembersUnresolved", "groupId=$groupSessionId, stored=${memberIds.size}, source=${if (allOps === stateOperators) "app_state" else "database"}")
+                        runCatching {
+                            repository.replyTurns.release(
+                                replyTurnId, replyLeaseToken,
+                                System.currentTimeMillis() + 5_000L, System.currentTimeMillis(),
+                                "group_members_unresolved"
+                            )
+                        }
+                        setGroupLoading(groupSessionId, false)
+                        if (mutexLocked) { mutexFor(groupSessionId).unlock(); mutexLocked = false }
+                        return@launch
+                    }
+                    _lastSendError.value = "所有群成员已被禁言，无法回复"
                     DebugLogger.diagnostic("GroupChat/NoActiveMembers", "groupId=$groupSessionId, stored=${memberIds.size}, resolved=${members.size}, muted=${mutedIds.size}, source=${if (allOps === stateOperators) "app_state" else "database"}")
                     repository.sendMessage(groupSessionId, ChatMessage(
                         id = repository.getNextMessageId(), sessionId = groupSessionId,

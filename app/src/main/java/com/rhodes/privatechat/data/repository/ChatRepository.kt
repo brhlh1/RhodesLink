@@ -145,6 +145,7 @@ class ChatRepository(
     suspend fun getAnchorCount(): Int = shared.getAnchorCount()
 
     suspend fun deleteOldAnchors(cutoff: Long) = shared.deleteOldAnchors(cutoff)
+    suspend fun restoreExpiredAnchorsToPermanent(now: Long) = shared.restoreExpiredAnchorsToPermanent(now)
     suspend fun enforceAnchorRetain(operatorId: String, keepCount: Int = 200) = shared.enforceAnchorRetain(operatorId, keepCount)
 
     suspend fun getMessageCount(): Int = shared.getMessageCount()
@@ -204,6 +205,14 @@ class ChatRepository(
         shared.restoreChatArchive(sessionId, operatorId, history, messages, summary)
 
     suspend fun deleteMessage(id: Long) = shared.deleteMessage(id)
+
+    suspend fun cleanupOrphanedReplyTurns(): Long = shared.cleanupOrphanedReplyTurns()
+    suspend fun deleteReplyTurnsBySession(sessionId: String) = shared.deleteReplyTurnsBySession(sessionId)
+    suspend fun cancelReplyTurn(turnId: String, error: String) = shared.cancelReplyTurn(turnId, error)
+    suspend fun retryableReplyTurnIds(since: Long, now: Long, limit: Long = 50L): List<String> =
+        shared.retryableReplyTurnIds(since, now, limit)
+    suspend fun clearMemoryVectorPartitions() = shared.clearMemoryVectorPartitions()
+    suspend fun markKnowledgeBasesNeedingReindex(now: Long = System.currentTimeMillis()) = shared.markKnowledgeBasesNeedingReindex(now)
 
     suspend fun insertSession(session: ChatSession) = shared.insertSession(session)
 

@@ -75,10 +75,17 @@ class DataViewModel(
 
     /** Old builds assigned short expiries before permanent retention became the default. */
     suspend fun restorePermanentMemoryRetentionIfNeeded() {
-        if (settings.cleanDaysMemoryItems >= 0) return
         val now = System.currentTimeMillis()
-        repository.updateActiveMemoryExpiry(Long.MAX_VALUE, now)
-        repository.restoreExpiredMemoryItems(Long.MAX_VALUE, now)
+        if (settings.cleanDaysMemoryItems < 0) {
+            repository.updateActiveMemoryExpiry(Long.MAX_VALUE, now)
+            repository.restoreExpiredMemoryItems(Long.MAX_VALUE, now)
+        }
+        // Anchors carry the expiry stamped when they were written, so changing the retention setting
+        // alone never revives them: recall queries and the daily sweep both filter on expiresAt.
+        // Re-derive the stored expiry only while the user's anchor retention is the permanent sentinel.
+        if (settings.cleanDaysAnchors < 0) {
+            repository.restoreExpiredAnchorsToPermanent(now)
+        }
     }
 
     suspend fun getMessageRanking(): List<SenderCount> = repository.getMessageCountPerSender()
