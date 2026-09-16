@@ -17,11 +17,11 @@ object Engine {
         for (p in game.players) {
             p.hand.clear(); p.discards.clear(); p.melds.clear()
             p.isRiichi = false; p.isFuriten = false; p.isTenpai = false
-            repeat(13) { p.hand.add(game.wall.removeLast()) }
+            repeat(13) { p.hand.add(game.wall.removeAt(game.wall.lastIndex)) }
             p.hand.sortBy { it.ordinalForSort() }
         }
         val dealer = game.dealer()
-        dealer.hand.add(game.wall.removeLast())
+        dealer.hand.add(game.wall.removeAt(game.wall.lastIndex))
         dealer.hand.sortBy { it.ordinalForSort() }
         game.winnerSeat = null; game.drawnIdx = -1
     }
@@ -30,7 +30,7 @@ object Engine {
         if (game.wall.isEmpty()) return
         game.lastDiscard = null
         val p = game.currentPlayer()
-        p.hand.add(game.wall.removeLast())
+        p.hand.add(game.wall.removeAt(game.wall.lastIndex))
         p.hand.sortBy { it.ordinalForSort() }
         game.drawnIdx = p.hand.size - 1
     }

@@ -92,7 +92,10 @@ object KnowledgeBaseTextProcessor {
             } else {
                 flush()
                 val level = match.groupValues[1].length
-                while (headings.size >= level) headings.removeLast()
+                // removeAt(lastIndex) instead of removeLast(): the latter binds to the Java 21
+                // SequencedCollection member at compile time and throws NoSuchMethodError on older Android
+                // runtimes, which users saw as "导入失败: No interface method removeLast(...)".
+                while (headings.size >= level) headings.removeAt(headings.lastIndex)
                 headings += match.groupValues[2].trim()
             }
         }

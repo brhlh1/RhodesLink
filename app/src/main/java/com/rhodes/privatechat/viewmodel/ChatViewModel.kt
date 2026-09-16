@@ -2832,7 +2832,9 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
         val sessionMessages = contextRead(session.id, "history_read", "prompt_history_read", 10_000L, onStage) {
             // getRecentMessagesSync returns newest-first; the rest of this build assumes oldest-first
             // (it slices the tail for the prompt and takeLast(3) for the recall query).
-            repository.getRecentMessagesSync(session.id, historyReadLimit.toLong()).reversed()
+            // asReversed().toList() instead of reversed(): List.reversed() binds to the Java 21 member and
+            // throws NoSuchMethodError on older Android runtimes (same class of bug as removeLast).
+            repository.getRecentMessagesSync(session.id, historyReadLimit.toLong()).asReversed().toList()
         }.orEmpty()
         DebugLogger.diagnostic(
             "PrivateChat/PromptHistoryRead",
