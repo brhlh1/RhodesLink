@@ -42,6 +42,16 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
+/**
+ * Request types produced in the background. Their callers use short fixed timeouts (12–60s) and some of
+ * them do not wait for a person, so the 深度思考 switch must never apply to them: reasoning would make the
+ * daily content, memory extraction or support answers fail outright.
+ */
+private val BACKGROUND_REQUEST_TYPES = setOf(
+    "Memory", "GroupMemory", "ChatArchive", "ChatArchiveCompact", "Dispatch", "Mahjong", "Poker",
+    "GenPrompt", "AiSupport", "FeatureChat", "ProactivePrivate", "ProactivePrivateContentRetry",
+)
+
 class AIService(
     private val client: HttpClient = createHttpClient(),
     /**
@@ -396,8 +406,13 @@ class AIService(
                 // DeepSeek enables thinking by default. Opt out unless the user turned on the 深度思考 switch:
                 // reasoning helps hard multi-step logic but roughly triples latency and cost, and the
                 // structured roleplay output already complies without it. Reasoning is never surfaced.
+                // Background generation (memory extraction, summaries, diary, dispatch, mahjong, support)
+                // has its own short timeouts (12-60s) and would start failing outright under thinking, so
+                // the switch is honoured for user-facing chat turns only.
                 thinking = if (config.id == "deepseek") {
-                    ThinkingParam(if (deepseekThinking()) "enabled" else "disabled")
+                    ThinkingParam(
+                        if (deepseekThinking() && requestType !in BACKGROUND_REQUEST_TYPES) "enabled" else "disabled"
+                    )
                 } else null
             )
             val response: HttpResponse = client.post(url) {

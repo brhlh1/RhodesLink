@@ -370,7 +370,7 @@ fun ModelSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 10.dp)) {
                     Column(Modifier.weight(1f)) {
                         Text("深度思考（更慢更准）", fontSize = 13.sp, color = TextPrimary)
-                        Text("打开后回复更慢、消耗更多，适合复杂剧情推理；思考过程不会展示给你。修改立即生效。", fontSize = 11.sp, color = TextSecondary)
+                        Text("打开后回复更慢（单次可能要 1–3 分钟）、消耗更多，适合复杂剧情推理。仅在聊天时生效，动态/日记/记忆等后台内容不受影响；思考过程不会展示给你。修改立即生效。", fontSize = 11.sp, color = TextSecondary)
                     }
                     Switch(checked = deepseekThinking, onCheckedChange = { on ->
                         deepseekThinking = on
