@@ -42,7 +42,14 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
-class AIService(private val client: HttpClient = createHttpClient()) {
+class AIService(
+    private val client: HttpClient = createHttpClient(),
+    /**
+     * Reads the user's 深度思考 switch (DeepSeek provider only). Injected as a lambda so this shared
+     * service keeps no settings dependency; defaults to off, which is the shipped behaviour.
+     */
+    private val deepseekThinking: () -> Boolean = { false },
+) {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -386,9 +393,12 @@ class AIService(private val client: HttpClient = createHttpClient()) {
                 // DeepSeek V4 Flash can emit whitespace-only completions when API JSON mode is combined
                 // with a long structured roleplay prompt. The prompt and local parser already enforce JSON.
                 response_format = if (jsonMode && supportsJsonMode(config.id) && config.id != "deepseek") ResponseFormat("json_object") else null,
-                // DeepSeek enables thinking by default. Always opt out so response latency,
-                // temperature behavior, and cost remain consistent with normal chat.
-                thinking = if (config.id == "deepseek") ThinkingParam("disabled") else null
+                // DeepSeek enables thinking by default. Opt out unless the user turned on the 深度思考 switch:
+                // reasoning helps hard multi-step logic but roughly triples latency and cost, and the
+                // structured roleplay output already complies without it. Reasoning is never surfaced.
+                thinking = if (config.id == "deepseek") {
+                    ThinkingParam(if (deepseekThinking()) "enabled" else "disabled")
+                } else null
             )
             val response: HttpResponse = client.post(url) {
                 contentType(ContentType.Application.Json)

@@ -54,5 +54,5 @@ fun sharedModule(databaseWrapper: DatabaseWrapper) = module {
         val key = settings.asrApiKey.ifBlank { settings.apiKey }
         if (settings.asrBaseUrl.isNotBlank() && key.isNotBlank()) AliyunDashScopeAsrGateway(apiKey = key, modelName = settings.asrModelName, endpoint = settings.asrBaseUrl) else DisabledAsrGateway()
     }
-    single { AIService() }
+    single { AIService(deepseekThinking = { get<SettingsRepository>().deepseekThinkingEnabled }) }
 }

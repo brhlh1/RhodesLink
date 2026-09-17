@@ -364,6 +364,21 @@ fun ModelSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 Spacer(Modifier.height(12.dp))
             }
 
+            // 深度思考：仅在 DeepSeek 服务商下显示。默认关闭；打开后更慢更贵，思考过程不会展示给用户。
+            if (currentProviderId == "deepseek") {
+                var deepseekThinking by remember { mutableStateOf(settings.deepseekThinkingEnabled) }
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 10.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text("深度思考（更慢更准）", fontSize = 13.sp, color = TextPrimary)
+                        Text("打开后回复更慢、消耗更多，适合复杂剧情推理；思考过程不会展示给你。修改立即生效。", fontSize = 11.sp, color = TextSecondary)
+                    }
+                    Switch(checked = deepseekThinking, onCheckedChange = { on ->
+                        deepseekThinking = on
+                        settings.deepseekThinkingEnabled = on
+                    })
+                }
+            }
+
             // API Key
             LabeledField("API 密钥") {
                 SecretInput(apiKey, { apiKey = it; errorText = "" }, ctx)

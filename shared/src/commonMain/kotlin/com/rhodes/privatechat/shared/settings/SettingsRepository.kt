@@ -210,6 +210,15 @@ class SettingsRepository(private val settings: ObservableSettings) {
         get() = getBoolean("automatic_context_window", true)
         set(value) = putBoolean("automatic_context_window", value)
 
+    /**
+     * DeepSeek turns thinking on by default, which roughly triples latency and cost for structured roleplay
+     * output that already complies without it. Off by default; the toggle only appears for that provider.
+     * Reasoning text is never rendered or stored, whichever way this is set.
+     */
+    var deepseekThinkingEnabled: Boolean
+        get() = getBoolean("deepseek_thinking_enabled", false)
+        set(value) = putBoolean("deepseek_thinking_enabled", value)
+
     var supportKnowledgeBaseId: String
         get() = getString("support_knowledge_base_id", "")
         set(value) = putString("support_knowledge_base_id", value)
