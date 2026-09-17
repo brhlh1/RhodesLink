@@ -26,6 +26,12 @@ object DailyContentScheduler {
     const val TYPE_PLAN = "plan"
     const val TYPE_MOMENT = "moment"
     const val TYPE_PRIVATE = "private"
+    const val TYPE_PRIVATE_FOLLOW_UP = "private_follow_up"
+    /** 同一角色当天的第几条主动消息。 */
+    const val DELIVERY_FIRST = "0"
+    const val DELIVERY_SECOND = "1"
+    const val DELIVERY_FOLLOW_UP = "f"
+    private const val SECOND_MESSAGE_MIN_GAP_MINUTES = 45L
     private const val PLAN_WORK = "daily-content-plan"
     private val zone = TimeZone.getTimeZone("Asia/Shanghai")
 
@@ -72,11 +78,54 @@ object DailyContentScheduler {
             settings.getOperatorMsgPermission(op.id) && (0..99).random() < settings.dailyProactiveChance &&
                 op.id !in dispatchedOperatorIds &&
                 hasConversationContext(repository, op.id)
-        }.shuffled().take(settings.dailyProactiveMax)
-        candidates.forEachIndexed { index, op ->
-            val base = scheduledTime(cycleStart, cycleEnd, "private:${op.id}:$index", now)
-            schedule(context, TYPE_PRIVATE, op.id, "0", avoidQuietHours(base, cycleEnd, settings, now))
+        }.shuffled()
+        // 额度分配：约四分之一留给"同一角色第二句"，其余给不同角色。
+        // 这样既有广度（每天不同的人来），又有一两次连发（更像真人发消息）。
+        val budget = proactiveBudgetFor(cycleEnd - now, settings.dailyProactiveMax)
+        val perOperatorMax = settings.proactivePerOperatorDailyMax.coerceAtLeast(1)
+        val secondSlots = if (perOperatorMax >= 2 && budget >= 4) (budget * 25 / 100).coerceAtLeast(1) else 0
+        val speakers = candidates.take((budget - secondSlots).coerceAtLeast(1))
+        val firstDeliveryAt = mutableListOf<Pair<String, Long>>()
+        val planEntries = mutableListOf<String>()
+        fun timeLabel(at: Long): String =
+            java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(at))
+        speakers.forEachIndexed { index, op ->
+            val at = avoidQuietHours(scheduledTime(cycleStart, cycleEnd, "private:${op.id}:$index", now), cycleEnd, settings, now)
+            firstDeliveryAt += op.id to at
+            planEntries += "${timeLabel(at)} ${op.name} 第1条"
+            schedule(context, TYPE_PRIVATE, op.id, DELIVERY_FIRST, at)
         }
+        // 第二句：与第一句至少间隔 45 分钟，且仍然避开免打扰时段。
+        firstDeliveryAt.shuffled().take(secondSlots).forEachIndexed { index, (opId, firstAt) ->
+            val spreadMs = TimeUnit.MINUTES.toMillis(SECOND_MESSAGE_MIN_GAP_MINUTES)
+            val extra = spreadMs + (opId.hashCode().toLong() and Long.MAX_VALUE) % (TimeUnit.HOURS.toMillis(3))
+            val at = (firstAt + extra).coerceAtMost(cycleEnd - TimeUnit.MINUTES.toMillis(10))
+            val adjusted = avoidQuietHours(at, cycleEnd, settings, now)
+            if (adjusted >= firstAt + TimeUnit.MINUTES.toMillis(SECOND_MESSAGE_MIN_GAP_MINUTES / 2)) {
+                planEntries += "${timeLabel(adjusted)} ${operators.firstOrNull { it.id == opId }?.name ?: opId} 第2条"
+                schedule(context, TYPE_PRIVATE, opId, DELIVERY_SECOND, adjusted)
+            }
+        }
+        // 补一句：紧跟在某条主动消息之后 3~10 分钟，概率由设置决定。用户回复了就会在投递时取消。
+        val followUpChance = settings.proactiveFollowUpChance
+        if (followUpChance > 0) {
+            firstDeliveryAt.forEachIndexed { index, (opId, firstAt) ->
+                if ((0..99).random() >= followUpChance) return@forEachIndexed
+                val delay = TimeUnit.MINUTES.toMillis(3L + (opId.hashCode().toLong() and Long.MAX_VALUE) % 8L)
+                val at = avoidQuietHours(firstAt + delay, cycleEnd, settings, now)
+                if (at <= cycleEnd - TimeUnit.MINUTES.toMillis(5)) {
+                    // 每个角色每天最多一条补句，所以投递编号可以用固定值，取消计划时才枚举得出来。
+                    planEntries += "${timeLabel(at)} ${operators.firstOrNull { it.id == opId }?.name ?: opId} 补一句"
+                    schedule(context, TYPE_PRIVATE_FOLLOW_UP, opId, DELIVERY_FOLLOW_UP, at)
+                }
+            }
+        }
+        DailyPlanDiagnostics.recordPlan(
+            context,
+            cycle,
+            if (planEntries.isEmpty()) listOf("今天没有安排任何主动消息（检查自动内容、主动私聊开关与角色权限）")
+            else planEntries.sorted(),
+        )
         settings.putBoolean("daily_content_planned_$cycle", true)
     }
 
@@ -92,10 +141,18 @@ object DailyContentScheduler {
         operators.forEach { op ->
             // dailyMomentTarget is capped at three, so these cover every possible old plan.
             repeat(3) { index -> workManager.cancelUniqueWork(workName(cycle, TYPE_MOMENT, op.id, index.toString())) }
-            workManager.cancelUniqueWork(workName(cycle, TYPE_PRIVATE, op.id, "0"))
+            cancelPrivateDeliveries(workManager, cycle, op.id)
         }
         settings.remove("daily_content_planned_$cycle")
         ensureTodayPlanSuspending(context, repository, settings)
+    }
+
+    /** 取消当天某个角色的全部主动消息投递（第一句、第二句、补句）。 */
+    private fun cancelPrivateDeliveries(workManager: WorkManager, cycle: String, operatorId: String) {
+        listOf(DELIVERY_FIRST, DELIVERY_SECOND, DELIVERY_FOLLOW_UP).forEach { deliveryId ->
+            workManager.cancelUniqueWork(workName(cycle, TYPE_PRIVATE, operatorId, deliveryId))
+            workManager.cancelUniqueWork(workName(cycle, TYPE_PRIVATE_FOLLOW_UP, operatorId, deliveryId))
+        }
     }
 
     /** Settings must not fail just because a best-effort background plan rebuild fails. */
@@ -117,11 +174,23 @@ object DailyContentScheduler {
                 val workManager = WorkManager.getInstance(context.applicationContext)
                 operatorIds.forEach { operatorId ->
                     repeat(3) { index -> workManager.cancelUniqueWork(workName(cycle, TYPE_MOMENT, operatorId, index.toString())) }
-                    workManager.cancelUniqueWork(workName(cycle, TYPE_PRIVATE, operatorId, "0"))
+                    cancelPrivateDeliveries(workManager, cycle, operatorId)
                 }
             }.onFailure { DebugLogger.diagnostic("DailyContent/CancelDeletedOperatorPlanFailed", it.message ?: it.javaClass.simpleName) }
             kotlinx.coroutines.withContext(Dispatchers.Main.immediate) { onComplete() }
         }
+    }
+
+    /**
+     * 当天剩余时间不足以把消息自然铺开时收缩配额。
+     *
+     * 计划常常是在玩家打开 App 时才补建的（后台任务被系统杀掉、跨天首次启动等）。
+     * 如果晚上 23 点才建计划却仍发满 8 条，玩家会在几十分钟内连续收到一堆消息，体验很差。
+     */
+    private fun proactiveBudgetFor(remainingMs: Long, configuredMax: Int): Int = when {
+        remainingMs <= TimeUnit.HOURS.toMillis(2) -> minOf(2, configuredMax)
+        remainingMs <= TimeUnit.HOURS.toMillis(6) -> minOf(4, configuredMax)
+        else -> configuredMax
     }
 
     private suspend fun hasConversationContext(repository: ChatRepository, operatorId: String): Boolean {

@@ -43,14 +43,40 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 /**
- * Request types produced in the background. Their callers use short fixed timeouts (12–60s) and some of
- * them do not wait for a person, so the 深度思考 switch must never apply to them: reasoning would make the
- * daily content, memory extraction or support answers fail outright.
+ * 允许使用深度思考的请求类型：**玩家能读到的内容创作**。
+ *
+ * 这里刻意用"允许名单"而不是"排除名单"。历史上用的是排除名单，结果动态、评论、日记、
+ * 分层记忆提取、Galgame、自检探针都因为没被登记而跟着开关走了思考模式，又慢又贵；
+ * 其中自检探针（max_tokens=16/64）会直接返回空内容，报出"模型不可用"的假故障。
+ *
+ * 用允许名单之后，新增任何调用点只要忘记登记，默认就是关闭思考（安全方向）。
+ *
+ * 绝对不能开思考的典型：小 max_tokens 的调用。实测 max_tokens=16/64 时思维链会吃光输出预算，
+ * content 返回空、finish_reason=length。
  */
-private val BACKGROUND_REQUEST_TYPES = setOf(
-    "Memory", "GroupMemory", "ChatArchive", "ChatArchiveCompact", "Dispatch", "Mahjong", "Poker",
-    "GenPrompt", "AiSupport", "FeatureChat", "ProactivePrivate", "ProactivePrivateContentRetry",
+private val THINKING_REQUEST_TYPES = setOf(
+    // 私聊：重新生成、继续说、识图后的角色回复（主回复带轮次后缀，见下方前缀）
+    "ChatRegenerate", "ChatContinue", "VisionChat",
+    // 主动私聊：主动消息本身与补一句
+    "ProactivePrivate", "ProactivePrivateContentRetry", "ProactivePrivateRepeatRetry", "ProactivePrivateFollowUp",
+    // 动态正文与评论
+    "Moment", "MomentContentRetry", "MomentComment", "MomentMention", "MomentReply",
+    // 日记
+    "Diary", "DiaryContentRetry",
 )
+
+/** 私聊/群聊主链路与重试的标签带轮次后缀，用前缀匹配。 */
+private val THINKING_REQUEST_PREFIXES = listOf("Chat#", "GroupChat#", "GroupChatContentRetry#")
+
+/**
+ * 纯函数：这个请求类型是否允许深度思考（不包含开关状态）。
+ *
+ * 默认关闭：记忆提取（MemoryL1/L2/L3、Memory、GroupMemory）、短期摘要、剧情存档、派遣、麻将、
+ * 扑克、客服、功能聊天、Galgame 剧情与进度判定、回复建议、自检探针，以及所有用默认标签 "Chat"
+ * 的内部调用，都不在名单里。
+ */
+fun allowsDeepSeekThinking(requestType: String): Boolean =
+    requestType in THINKING_REQUEST_TYPES || THINKING_REQUEST_PREFIXES.any { requestType.startsWith(it) }
 
 class AIService(
     private val client: HttpClient = createHttpClient(),
@@ -331,6 +357,12 @@ class AIService(
         val promptCacheMissTokens: Int? = null,
         val reasoningContent: String? = null,
         val thinkingDisabled: Boolean = false,
+        /** 服务端单独统计的思维链 token；服务商未返回该字段时为 null。 */
+        val reasoningTokens: Int? = null,
+        /** 思维链字符数；服务端未返回 reasoning_tokens 时用于估算与诊断。 */
+        val reasoningChars: Int = 0,
+        /** 服务端结束原因（stop/length/...）。"length" 表示输出被上限截断，需要留意输出预算。 */
+        val finishReason: String? = null,
     )
 
     /**
@@ -347,18 +379,37 @@ class AIService(
         cacheHitTokens: Int? = null,
         cacheMissTokens: Int? = null,
         requestType: String,
-        outcome: String
+        outcome: String,
+        reasoningTokens: Int? = null,
+        reasoning: String? = null,
+        finishReason: String? = null
     ) {
         val system = messages.filter { it.role == "system" }.joinToString("\n\n") { it.content }
         val cacheTotal = if (cacheHitTokens != null && cacheMissTokens != null) cacheHitTokens + cacheMissTokens else null
         val cacheRate = cacheTotal?.takeIf { it > 0 }?.let { cacheHitTokens!! * 100 / it }
+        val reasoningChars = reasoning?.length ?: 0
         println(
             "RHODES_AI_METRIC requestType=$requestType provider=$providerId model=$modelName outcome=$outcome " +
                 "messages=${messages.size} systemChars=${system.length} " +
                 "systemFingerprint=${systemFingerprint(system)} inputTokens=$inputTokens " +
                 "outputTokens=$outputTokens promptCacheHitTokens=${cacheHitTokens ?: "unavailable"} " +
-                "promptCacheMissTokens=${cacheMissTokens ?: "unavailable"} promptCacheTokenHitRate=${cacheRate ?: "unavailable"} elapsedMs=$elapsedMs"
+                "promptCacheMissTokens=${cacheMissTokens ?: "unavailable"} promptCacheTokenHitRate=${cacheRate ?: "unavailable"} " +
+                "reasoningTokens=${reasoningTokens ?: "unavailable"} reasoningChars=$reasoningChars " +
+                "reasoningTokensEstimate=${estimateReasoningTokens(reasoning)} " +
+                "finishReason=${finishReason ?: "unavailable"} elapsedMs=$elapsedMs"
         )
+    }
+
+    /**
+     * 服务端没有返回 reasoning_tokens 时按字符构成的估算。换算比例取自 DeepSeek 官方文档：
+     * 英文 1 字符 ≈ 0.3 token，中文 1 字符 ≈ 0.6 token。仅用于诊断展示，不参与计费或限额判断。
+     */
+    private fun estimateReasoningTokens(reasoning: String?): Int {
+        if (reasoning.isNullOrBlank()) return 0
+        var ascii = 0
+        var wide = 0
+        for (ch in reasoning) if (ch.code <= 0x7F) ascii++ else wide++
+        return (ascii * 0.3 + wide * 0.6).toInt()
     }
 
     private fun systemFingerprint(system: String): String {
@@ -403,16 +454,12 @@ class AIService(
                 // DeepSeek V4 Flash can emit whitespace-only completions when API JSON mode is combined
                 // with a long structured roleplay prompt. The prompt and local parser already enforce JSON.
                 response_format = if (jsonMode && supportsJsonMode(config.id) && config.id != "deepseek") ResponseFormat("json_object") else null,
-                // DeepSeek enables thinking by default. Opt out unless the user turned on the 深度思考 switch:
-                // reasoning helps hard multi-step logic but roughly triples latency and cost, and the
-                // structured roleplay output already complies without it. Reasoning is never surfaced.
-                // Background generation (memory extraction, summaries, diary, dispatch, mahjong, support)
-                // has its own short timeouts (12-60s) and would start failing outright under thinking, so
-                // the switch is honoured for user-facing chat turns only.
+                // DeepSeek enables thinking by default. Only player-readable content creation is
+                // allowed to use it (see allowsDeepSeekThinking); everything else is opted out
+                // explicitly so a forgotten call site can never silently burn reasoning tokens.
+                // Reasoning is never surfaced to the user.
                 thinking = if (config.id == "deepseek") {
-                    ThinkingParam(
-                        if (deepseekThinking() && requestType !in BACKGROUND_REQUEST_TYPES) "enabled" else "disabled"
-                    )
+                    ThinkingParam(if (deepseekThinking() && allowsDeepSeekThinking(requestType)) "enabled" else "disabled")
                 } else null
             )
             val response: HttpResponse = client.post(url) {
@@ -427,13 +474,18 @@ class AIService(
             }
             val responseBody = response.bodyAsText()
             val completion = json.decodeFromString<NonStreamResponse>(responseBody)
-            val msg = completion.choices?.firstOrNull()?.message
+            val choice = completion.choices?.firstOrNull()
+            val msg = choice?.message
             val rawContent = msg?.content ?: ""
             val content = if (rawContent.isBlank() || rawContent.all { it.isWhitespace() }) "" else rawContent
             val inputTokens = completion.usage?.promptTokens ?: 0
             val outputTokens = completion.usage?.completionTokens ?: 0
             val cacheHit = completion.usage?.promptCacheHitTokens
             val cacheMiss = completion.usage?.promptCacheMissTokens
+            // 思维链只在这里读取长度与 token 统计，绝不写入聊天记录或用户可见日志。
+            val reasoning = msg?.reasoningContent
+            val reasoningTokens = completion.usage?.completionTokensDetails?.reasoningTokens
+            val finishReason = choice?.finishReason
             logRequestMetrics(
                 providerId = config.id,
                 modelName = model,
@@ -444,16 +496,26 @@ class AIService(
                 cacheHitTokens = cacheHit,
                 cacheMissTokens = cacheMiss,
                 requestType = requestType,
-                outcome = if (content.isBlank()) "empty" else "success"
+                outcome = if (content.isBlank()) "empty" else "success",
+                reasoningTokens = reasoningTokens,
+                reasoning = reasoning,
+                finishReason = finishReason
             )
+            if (finishReason == "length") {
+                // 输出被 max_tokens 截断：结构化输出很可能因此解析失败，单独留一条诊断。
+                println("RHODES_AI_METRIC_WARN requestType=$requestType provider=${config.id} model=$model issue=finish_reason_length outputTokens=$outputTokens reasoningTokens=${reasoningTokens ?: "unavailable"}")
+            }
             return ChatResult(
                 content = content,
                 inputTokens = inputTokens,
                 outputTokens = outputTokens,
                 promptCacheHitTokens = completion.usage?.promptCacheHitTokens,
                 promptCacheMissTokens = completion.usage?.promptCacheMissTokens,
-                reasoningContent = msg?.reasoningContent,
+                reasoningContent = reasoning,
                 thinkingDisabled = config.id == "deepseek",
+                reasoningTokens = reasoningTokens,
+                reasoningChars = reasoning?.length ?: 0,
+                finishReason = finishReason,
             )
         }
 

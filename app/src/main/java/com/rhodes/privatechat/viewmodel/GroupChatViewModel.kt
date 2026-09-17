@@ -113,6 +113,11 @@ class GroupChatViewModel(
         private const val GROUP_RULES_MAX_CHARS = 3_000
         private const val GROUP_MEMBER_PERSONA_MAX_CHARS = 1_500
         private const val GROUP_MEMBER_PROFILES_MAX_CHARS = 8_000
+        /**
+         * 深度思考开启时，群聊模型请求与整轮预算各加的一段余量。
+         * 与私聊使用同一口径：思考模式变慢时才放宽，关闭时预算与旧版完全一致。
+         */
+        private const val THINKING_BUDGET_BONUS_MS = 60_000L
         // A WorkManager task can construct a second MainViewModel in this process.
         // Auto scheduling must therefore be shared across all GroupChatViewModel instances.
         private val autoChatGenerations = ConcurrentHashMap<String, Long>()
@@ -125,6 +130,18 @@ class GroupChatViewModel(
     }
 
     private val autoLogInstanceId = Integer.toHexString(System.identityHashCode(this))
+
+    /** 当前厂商与开关是否真的会让本次请求走深度思考。 */
+    private val deepseekThinkingActive: Boolean
+        get() = settings.provider == "deepseek" && settings.deepseekThinkingEnabled
+
+    /** 单次群聊模型请求预算；深度思考开启时多留一段余量。 */
+    private val groupModelTimeoutMs: Long
+        get() = GROUP_MODEL_TIMEOUT_MS + if (deepseekThinkingActive) THINKING_BUDGET_BONUS_MS else 0L
+
+    /** 群聊整轮预算；租约到期时间必须用同一个值，否则思考模式变慢后租约可能先失效。 */
+    private val groupReplyTimeoutMs: Long
+        get() = GROUP_REPLY_TIMEOUT_MS + if (deepseekThinkingActive) THINKING_BUDGET_BONUS_MS else 0L
 
     private val groupActivityCache = ConcurrentHashMap<String, String>()
     private val _groupMessages = MutableStateFlow<List<ChatMessage>>(emptyList())
@@ -743,6 +760,9 @@ class GroupChatViewModel(
             var mutexLocked = false
             var batchIds = emptySet<Long>()
             var responseStored = false
+            // 本轮预算在进入本轮时固化一次：租约到期、模型请求上限和超时文案共用同一个值，
+            // 避免中途切换深度思考开关导致口径跳变。关闭深度思考时与旧版完全一致。
+            val turnBudgetMs = groupReplyTimeoutMs
             try {
                 if (replyTurnId.isBlank()) replyTurnId = replyTurnIdOverride ?: "group:$groupSessionId:${retryMessageId ?: sourceMessageId ?: userMessageId ?: return@launch}"
                 replyLeaseToken = replyLeaseTokenOverride ?: UUID.randomUUID().toString()
@@ -751,7 +771,7 @@ class GroupChatViewModel(
                         val now = System.currentTimeMillis()
                         repository.createReplyTurn(com.rhodes.privatechat.shared.model.ReplyTurn(replyTurnId, groupSessionId, "group", "manual", retryMessageId ?: sourceMessageId ?: userMessageId, "", mode, "pending", 0, now, "", 0, null, "", now, now, 0))
                     }
-                    val claimed = repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + GROUP_REPLY_TIMEOUT_MS)
+                    val claimed = repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + groupReplyTimeoutMs)
                     if (claimed == null) {
                         DebugLogger.diagnostic("GroupChat/ReplyTurnLeaseDenied", "roundId=$debugRoundId,attempt=$sendAttemptId,groupId=$groupSessionId,turnId=$replyTurnId,messageId=${retryMessageId ?: sourceMessageId ?: userMessageId ?: 0}")
                         DebugLogger.conversationStep(debugRoundId, "群聊", "回复任务租约", "已由其他任务处理", "当前消息正在由恢复任务处理，未抢占租约")
@@ -815,7 +835,7 @@ class GroupChatViewModel(
                 setGroupLoading(groupSessionId, true)
                 turnStartedAtMs = android.os.SystemClock.elapsedRealtime()
                 fun turnElapsedMs(): Long = (android.os.SystemClock.elapsedRealtime() - turnStartedAtMs).coerceAtLeast(0L)
-                fun remainingTurnBudget(): Long = (GROUP_REPLY_TIMEOUT_MS - turnElapsedMs()).coerceAtLeast(1L)
+                fun remainingTurnBudget(): Long = (turnBudgetMs - turnElapsedMs()).coerceAtLeast(1L)
                 suspend fun <T> optionalGroupContext(
                     label: String,
                     module: String,
@@ -1294,9 +1314,10 @@ class GroupChatViewModel(
                 DebugLogger.conversationStep(debugRoundId, "群聊", "模型请求", "开始", "成员=${activeMembers.joinToString("、") { it.name }}，自动=$isAuto，消息数=${apiMessages.size}")
                 // In automatic mode, send requested history first and retry only after the
                 // provider reports its real context limit.
-                val maxPromptTokens = (settings.maxContextTokens - 2000).coerceAtLeast(512)
+                // 手动上限模式必须为本次输出留余量，深度思考开启时思维链还要额外占一份。
+                val maxPromptTokens = (settings.maxContextTokens - sharedUtils.promptOutputReserveTokens()).coerceAtLeast(512)
                 var totalTokens = apiMessages.sumOf { estimateTokens(it.content) + 10 }
-                com.rhodes.privatechat.util.DebugLogger.log("GroupChat/Token", if (settings.automaticContextWindow) "自动上下文：跳过本地 token 裁剪，超限交由模型服务返回后重试；消息数=${apiMessages.size}" else "估算token=$totalTokens, 上限=$maxPromptTokens, 消息数=${apiMessages.size}")
+                com.rhodes.privatechat.util.DebugLogger.log("GroupChat/Token", if (settings.automaticContextWindow) "自动上下文：跳过本地 token 裁剪，超限交由模型服务返回后重试；消息数=${apiMessages.size}" else "估算token=$totalTokens, 上限=$maxPromptTokens, ${sharedUtils.promptOutputReserveNote()}, 消息数=${apiMessages.size}")
                 if (!settings.automaticContextWindow && totalTokens > maxPromptTokens) {
                     // Preserve runtime/task tail blocks while trimming only dialogue history.
                     val protectedTailCount = if (!isAuto && apiMessages.size >= 4) 3 else 2
@@ -1315,7 +1336,7 @@ class GroupChatViewModel(
                 }
                 DebugLogger.conversationStep(debugRoundId, "群聊", "提示词总构建", "完成", "预算=${GROUP_PROMPT_TIMEOUT_MS}ms；耗时=${promptElapsedMs}ms；消息=${apiMessages.size}条")
                 suspend fun generateGroupReply(messages: List<AiMessage>, tag: String, stage: String): String {
-                    val budget = minOf(GROUP_MODEL_TIMEOUT_MS, remainingTurnBudget())
+                    val budget = minOf(groupModelTimeoutMs, remainingTurnBudget())
                     pipelineStage = stage
                     return withChatStageTimeout("group", stage, budget) {
                         sharedUtils.chatResult(messages, tag).also(cacheUsage::record).content
@@ -1471,7 +1492,7 @@ class GroupChatViewModel(
                 if ((groupGenerations[groupSessionId] ?: 0L) != generation) return@launch
                 if (isAuto && autoGeneration != null && autoChatGenerations[groupSessionId] != autoGeneration) return@launch
                 val turnElapsed = if (turnStartedAtMs > 0L) (android.os.SystemClock.elapsedRealtime() - turnStartedAtMs).coerceAtLeast(0L) else 0L
-                DebugLogger.diagnostic("ChatTimeout", "surface=group,roundId=$debugRoundId,groupId=$groupSessionId,stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs},turnBudgetMs=$GROUP_REPLY_TIMEOUT_MS,turnElapsedMs=$turnElapsed,exceptionType=${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}")
+                DebugLogger.diagnostic("ChatTimeout", "surface=group,roundId=$debugRoundId,groupId=$groupSessionId,stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs},turnBudgetMs=$turnBudgetMs,turnElapsedMs=$turnElapsed,thinking=$deepseekThinkingActive,exceptionType=${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}")
                 DebugLogger.chatEvent("群聊", e.stage.chatStageLabel(), "超时", "群=$groupName，预算=${e.budgetMs}ms，耗时=${e.elapsedMs}ms")
                 DebugLogger.conversationStep(debugRoundId, "群聊", e.stage.chatStageLabel(), "失败", "超时；预算=${e.budgetMs}ms，耗时=${e.elapsedMs}ms，未生成或保存AI回复")
                 DebugLogger.attachOperationModule(debugRoundId, "模型用量", cacheUsage.summary())
@@ -1483,14 +1504,14 @@ class GroupChatViewModel(
                 if ((groupGenerations[groupSessionId] ?: 0L) != generation) return@launch
                 if (isAuto && autoGeneration != null && autoChatGenerations[groupSessionId] != autoGeneration) return@launch
                 Log.e("GroupChat", "Timeout: ${e.message}")
-                DebugLogger.log("GroupChat/Error", "整轮处理超时：${e.message ?: "超过${GROUP_REPLY_TIMEOUT_MS / 1000}秒"}")
+                DebugLogger.log("GroupChat/Error", "整轮处理超时：${e.message ?: "超过${turnBudgetMs / 1000}秒"}")
                 DebugLogger.chatEvent("群聊", "请求模型", "超时", "群=$groupName")
                 DebugLogger.conversationStep(debugRoundId, "群聊", "本轮结果", "失败", "模型请求超时")
                 DebugLogger.attachOperationModule(debugRoundId, "模型用量", cacheUsage.summary())
                 DebugLogger.conversationStep(debugRoundId, "群聊", "本轮总览", "失败", "模式=$mode，自动=$isAuto，原因=模型请求超时，缓存=${cacheUsage.summary()}")
                 failureSnapshot("group_pipeline_timeout", e)
                 markGroupMessagesUndelivered(groupSessionId, if (batchIds.isNotEmpty()) batchIds else failureMessageId?.let(::setOf).orEmpty(), groupName)
-                if (!isAuto) _lastSendError.value = "群聊整轮处理超时（预算${GROUP_REPLY_TIMEOUT_MS / 1000}秒），本轮未生成或保存AI回复，请重试"
+                if (!isAuto) _lastSendError.value = "群聊整轮处理超时（预算${turnBudgetMs / 1000}秒），本轮未生成或保存AI回复，请重试"
             } catch (e: kotlinx.coroutines.CancellationException) {
                 markGroupMessagesUndelivered(groupSessionId, if (batchIds.isNotEmpty()) batchIds else failureMessageId?.let(::setOf).orEmpty(), groupName)
                 throw e
@@ -1626,7 +1647,7 @@ class GroupChatViewModel(
             "pending", 0, turnNow, "", 0, null, "", turnNow, turnNow, 0,
         ))
         val leaseToken = UUID.randomUUID().toString()
-        if (repository.claimReplyTurn(turnId, leaseToken, System.currentTimeMillis(), System.currentTimeMillis() + GROUP_REPLY_TIMEOUT_MS) == null) {
+        if (repository.claimReplyTurn(turnId, leaseToken, System.currentTimeMillis(), System.currentTimeMillis() + groupReplyTimeoutMs) == null) {
             GroupAutoChatScheduler.releaseClaim(context, settings, groupId, plan.round - 1, plan.token, plan.revision)
             return false
         }
@@ -1967,7 +1988,7 @@ class GroupChatViewModel(
                     repository.updateMessageContent(id, placeholderJson)
                 }
                 replyLeaseToken = replyLeaseTokenOverride ?: UUID.randomUUID().toString()
-                if (replyLeaseTokenOverride == null && repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + GROUP_REPLY_TIMEOUT_MS) == null) return@launch
+                if (replyLeaseTokenOverride == null && repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + groupReplyTimeoutMs) == null) return@launch
                 if (existingMessageId == null) com.rhodes.privatechat.automation.ManualReplyScheduler.scheduleTurn(context, replyTurnId)
                 unhideSession(groupSessionId)
                 // The message is safely persisted now. The composer must never wait for vision/AI work.

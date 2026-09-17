@@ -25,7 +25,7 @@ object PortableSettings {
         "private_recall_moment_memory", "private_recall_moment_comment_memory", "private_recall_relationship_memory",
         "private_recall_diary_memory", "private_recall_manual_memory", "auto_ai_enabled",
         "daily_auto_moment_enabled", "idle_proactive_chat_enabled", "auto_moment_enabled", "auto_diary_enabled",
-        "quiet_hours_enabled", "auto_status_refresh", "dispatch_fast_mode",
+        "quiet_hours_enabled", "auto_status_refresh", "dispatch_fast_mode", "proactive_permission_all",
     )
     private val intKeys = setOf(
         "ai_temperature", "history_messages", "max_context_tokens", "clean_days",
@@ -40,6 +40,7 @@ object PortableSettings {
         "moment_min_chars", "moment_max_chars", "diary_min_chars", "diary_max_chars", "group_chat_min_interval",
         "group_chat_max_interval", "group_auto_max_rounds", "daily_intimacy_cap", "lmb", "daily_lmb_count",
         "daily_moment_target", "daily_proactive_chance", "daily_proactive_max", "quiet_hours_start", "quiet_hours_end",
+        "proactive_per_operator_daily_max", "proactive_followup_chance", "proactive_min_gap_minutes",
         "sleep_alarm_hour", "sleep_alarm_minute", "sleep_inactivity_minutes", "sleep_dim_after_seconds",
         "sleep_snooze_minutes", "clean_days_messages", "clean_days_anchors", "clean_days_diaries",
         "clean_days_moments", "clean_days_dispatches", "group_msg_min", "group_msg_max", "group_speech_min",
@@ -85,7 +86,15 @@ object PortableSettings {
             }
             when (encoded.substring(0, separator)) {
                 "s" -> settings.putString(key, encoded.substring(separator + 1))
-                "b" -> encoded.substring(separator + 1).toBooleanStrictOrNull()?.let { settings.putBoolean(key, it) }
+                "b" -> encoded.substring(separator + 1).toBooleanStrictOrNull()?.let { value ->
+                    // 角色主动消息权限必须按"显式设置"回填，否则恢复出来的权限会被全局开关覆盖，
+                    // 玩家会以为备份丢了权限。
+                    if (key.startsWith("msg_") && !key.endsWith("_explicit")) {
+                        settings.putOperatorMsgPermission(key.removePrefix("msg_"), value)
+                    } else {
+                        settings.putBoolean(key, value)
+                    }
+                }
                 "i" -> encoded.substring(separator + 1).toIntOrNull()?.let { settings.putInt(key, it) }
                 "l" -> encoded.substring(separator + 1).toLongOrNull()?.let { settings.putLong(key, it) }
             }
@@ -98,7 +107,7 @@ object PortableSettings {
             val id = operator.id
             listOf(
                 "operator_prompt_slot_${id}_private", "operator_prompt_slot_${id}_group", "msg_$id", "dyn_$id",
-                "voice_volume_$id", "chat_tts_$id", "bg_$id", "diary_read_at_$id", "last_mode_$id",
+                "msg_${id}_explicit", "voice_volume_$id", "chat_tts_$id", "bg_$id", "diary_read_at_$id", "last_mode_$id",
             ).forEach(settings::remove)
             (1..3).forEach { slot ->
                 settings.remove("operator_prompt_slot_${id}_private_$slot")

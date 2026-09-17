@@ -37,6 +37,7 @@ import com.rhodes.privatechat.shared.model.MomentLike
 import com.rhodes.privatechat.shared.model.Operator
 import com.rhodes.privatechat.util.DebugLogger
 import com.rhodes.privatechat.automation.DailyContentScheduler
+import com.rhodes.privatechat.automation.DailyPlanDiagnostics
 import com.rhodes.privatechat.automation.ManualReplyScheduler
 import com.rhodes.privatechat.notification.RhodesNotificationCenter
 import com.rhodes.privatechat.notification.RhodesAppVisibility
@@ -144,6 +145,8 @@ class MainViewModel(
         private const val STARTUP_BACKLOG_DELAY_MS = 10_000L
         /** Pace the per-role anchor trimming instead of hammering the single database lane. */
         private const val ANCHOR_TRIM_PACING_MS = 40L
+        /** 补一句只允许跟在"刚发出的主动消息"后面；超过这个时间窗口就作废。 */
+        private const val FOLLOW_UP_WINDOW_MS = 30L * 60 * 1000
         /** 道具价格 */
         const val PROP_PRICE = 100
         /** 防止多个 ViewModel 实例并发执行自动生成 */
@@ -622,18 +625,26 @@ class MainViewModel(
             if (!permissionsDone) {
                 settings.applyContextMode("standard")
                 val allOps = repository.getAllOperatorsSync()
+                // 动态权限保持原有收紧口径：动态消耗高，只默认开启预设干员。
                 for (op in allOps) {
                     settings.putOperatorDynPermission(op.id, false)
-                    settings.putOperatorMsgPermission(op.id, false)
                 }
                 val enabledOps = setOf("amiya", "kaltsit", "suzuran", "shu", "muelsyse", "exusiai", "priestess", "goldenglow", "zhuang_fangyi", "loxy")
                 for (op in allOps) {
                     if (op.id in enabledOps) {
                         settings.putOperatorDynPermission(op.id, true)
-                        settings.putOperatorMsgPermission(op.id, true)
                     }
                 }
+                // 主动消息权限不再批量写死：默认跟随全局开关（proactivePermissionAll）。
+                // 旧逻辑把 147 个内置角色里的 137 个批量设为"无授权"，玩家几乎收不到主动消息。
                 settings.putBoolean("permissions_initialized", true)
+            }
+            // 一次性迁移：老版本"主动私聊"默认关闭，绝大多数老玩家从未收到过主动消息。
+            // 这里只打开总开关并让权限跟随全局；动态权限、每日动态数量等玩家设置一律不动。
+            if (!settings.getBoolean("proactive_default_on_v1", false)) {
+                settings.idleProactiveChatEnabled = true
+                settings.proactivePermissionAll = true
+                settings.putBoolean("proactive_default_on_v1", true)
             }
             repository.migrateOldRelationships()
             if (!settings.getBoolean("preset_groups_initialized", false)) {
@@ -839,11 +850,24 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
         }
         // 构建替换映射
         val shortTerm = repository.getShortTermMemory(session.id)
-        val continuity = settings.getPrivateTurnState(session.id)?.let {
-            "【当前对话进展】\n状态：${it.activity}\n心情：${it.emotion}\n位置：${it.location}\n最近进展：${it.currentTopic}"
+        val turnState = settings.getPrivateTurnState(session.id)
+        val impression = repository.getLongTermImpression(op.id)?.content.orEmpty()
+        val currentActivity = turnState?.activity?.takeIf { it.isNotBlank() && it != "无" } ?: op.activity
+        val currentLocation = turnState?.location?.takeIf { it.isNotBlank() && it != "无" } ?: op.location
+        val unresolvedThread = turnState?.unresolvedThread.orEmpty().takeIf { it.isNotBlank() && it != "无" }
+        val continuity = turnState?.let {
+            "【当前对话进展】\n状态：${it.activity}\n心情：${it.emotion}\n位置：${it.location}\n最近进展：${it.currentTopic}" +
+                (unresolvedThread?.let { thread -> "\n未收束事项：$thread" } ?: "")
         }.orEmpty()
+        // 召回查询词必须来自最近对话内容。用角色名当查询词会召回与当前话题无关的往事，
+        // 主动消息就会突然提起一件毫不相干的事（实测约每 6 条出现 1 次，是"内容很奇怪"的主因）。
+        val recallQuery = history.takeLast(3)
+            .map { message -> (if (message.isMe) "用户：" else "干员：") + proactiveMessageText(message).take(120) }
+            .filter { it.length > 3 }
+            .joinToString("\n")
+            .ifBlank { op.name }
         val v2Memories = memoryV2Pipeline.buildPrivateMemoryContext(
-            op.id, limitL1 = 1, limitL2 = 2, limitL3 = 2, query = op.name,
+            op.id, limitL1 = 1, limitL2 = 2, limitL3 = 2, query = recallQuery,
             applyPrivateSourceFilter = true,
         ).ifBlank { "无" }
         val unifiedMemory = UnifiedMemoryContext.mergeBlocks(
@@ -852,7 +876,8 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
         )
         DebugLogger.log(
             "Memory/Inject",
-            "主动消息统一记忆注入: op=${op.id}, summary=${shortTerm != null}, memory=${v2Memories != "无"}"
+            "主动消息统一记忆注入: op=${op.id}, summary=${shortTerm != null}, memory=${v2Memories != "无"}, " +
+                "impression=${impression.isNotBlank()}, queryChars=${recallQuery.length}"
         )
         val replacements = mapOf(
             "CURRENT_TIME" to now,
@@ -861,7 +886,11 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
             "USER_BIO" to profile.bio.ifBlank { "无" },
             "USER_CONTENT" to "(用户没有说话)",
             "PROACTIVE_TRIGGER_TYPE" to "idle",
-            "PROACTIVE_TRIGGER_CONTEXT" to proactiveContext.summary,
+            "PROACTIVE_TRIGGER_CONTEXT" to buildString {
+                append(proactiveContext.summary)
+                append("\n干员当前状态：").append(currentActivity.ifBlank { "未知" })
+                append("；当前位置：").append(currentLocation.ifBlank { "未知" })
+            },
             "PROACTIVE_CURRENT_TIME" to now,
             "PROACTIVE_LAST_USER_MESSAGE" to proactiveContext.lastUserMessage,
             "PROACTIVE_LAST_USER_TIME" to proactiveContext.lastUserTime,
@@ -871,7 +900,11 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
             "PROACTIVE_IDLE_DURATION" to proactiveContext.idleDuration,
             "PROACTIVE_TIME_RELATION" to proactiveContext.timeRelation,
             "PROACTIVE_CONTEXT_MODE" to proactiveContext.mode,
-            "PROACTIVE_UNRESOLVED_TOPIC" to proactiveContext.unresolvedTopic,
+            "PROACTIVE_UNRESOLVED_TOPIC" to (
+                proactiveContext.unresolvedTopic.takeIf { it.isNotBlank() && it != "无" }
+                    ?: unresolvedThread?.let { "尚未收束：$it" }
+                    ?: "无"
+                ),
             "PROACTIVE_RECENT_HISTORY" to proactiveContext.recentHistory,
             "PRIVATE_CONTINUITY_STATE" to continuity,
             "HYPNOSIS" to "",
@@ -880,7 +913,7 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
             "OPERATOR_TITLE" to (if (op.title.isNullOrBlank()) "" else "（${op.title}）"),
             "OPERATOR_PERSONA" to (op.privatePrompt.ifBlank { op.description }),
             "OPERATOR_GENDER" to op.gender.ifBlank { "未设置" },
-            "LONG_TERM_IMPRESSION" to "无",
+            "LONG_TERM_IMPRESSION" to impression.ifBlank { "无" },
             "PERSONAL_MEMORY_REFERENCE_STYLE" to personalMemoryReferenceRule(),
             "USER_PREFS" to "无",
             "MEMORY_ANCHORS" to unifiedMemory,
@@ -926,8 +959,8 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
 
                 【本轮主动任务】
                 请依据上述资料主动向用户发送一条消息。
-                必须先依次输出【状态】【心情】【位置】【本轮简述】，每个标签恰好一次。
-                状态不超过10字，心情不超过5字，位置不超过10字，本轮简述不超过160字。
+                必须先依次输出【状态】【心情】【位置】，每个标签恰好一次。
+                状态不超过10字，心情不超过5字，位置不超过10字。
                 然后输出一条【台词】。不要输出【旁白】、JSON 或额外说明。""".trimIndent()
             )
         try {
@@ -937,20 +970,59 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
             if (normalized.segments.orEmpty().none { it.type.equals("dialogue", true) && it.content.isNotBlank() }) {
                 val retryConversation = conversation.mapIndexed { index, message ->
                     if (index == 0 && message.role == "system") message.copy(
-                        content = message.content + "\n\n【重新生成要求】\n必须按【状态】【心情】【位置】【本轮简述】【台词】顺序输出；只保留一条非空【台词】，不得输出【旁白】、JSON 或解释。"
+                        content = message.content + "\n\n【重新生成要求】\n必须按【状态】【心情】【位置】【台词】顺序输出；只保留一条非空【台词】，不得输出【旁白】、JSON 或解释。"
                     ) else message
                 }
                 normalized = normalizeProactiveResponse(
                     sharedUtils.aiService.normalizeOfflineResponse(withTimeout(60_000) { sharedUtils.chat(retryConversation, "ProactivePrivateContentRetry") })
                 )
             }
+            var dialogueText = normalized.segments.orEmpty()
+                .firstOrNull { it.type.equals("dialogue", true) && it.content.isNotBlank() }
+                ?.content.orEmpty()
+            // 复读检查：换词重复上一条会立刻被玩家看出来。相似度过高时按同一机制重生成一次。
+            if (dialogueText.isNotBlank() && proactiveSimilarToLastAi(dialogueText, proactiveContext.lastAiMessage)) {
+                val lastAi = proactiveContext.lastAiMessage
+                DebugLogger.log("Proactive/RepeatRetry", "op=${op.id}, 与上一条过于相似，重试一次")
+                val retryConversation = conversation.mapIndexed { index, message ->
+                    if (index == 0 && message.role == "system") message.copy(
+                        content = message.content + "\n\n【禁止复读】\n你上一次已经说过：「$lastAi」。这次必须换一件新的事或新的说法，不得换词重复上面这句。"
+                    ) else message
+                }
+                val retried = normalizeProactiveResponse(
+                    sharedUtils.aiService.normalizeOfflineResponse(withTimeout(60_000) { sharedUtils.chat(retryConversation, "ProactivePrivateRepeatRetry") })
+                )
+                val retriedText = retried.segments.orEmpty()
+                    .firstOrNull { it.type.equals("dialogue", true) && it.content.isNotBlank() }
+                    ?.content.orEmpty()
+                if (retriedText.isNotBlank() && !proactiveSimilarToLastAi(retriedText, lastAi)) {
+                    normalized = retried
+                    dialogueText = retriedText
+                }
+            }
             val raw = json.encodeToString(com.rhodes.privatechat.shared.model.OfflineModeResponse.serializer(), normalized)
-            if (normalized.segments.orEmpty().any { it.type.equals("dialogue", true) && it.content.isNotBlank() }) {
+            if (dialogueText.isNotBlank()) {
                 val msgId = repository.getNextMessageId()
                 repository.sendMessage(session.id, ChatMessage(
                     id = msgId, sessionId = session.id,
                     senderName = op.name, content = raw,
-                    type = "ai_json", mode = "online", isMe = false
+                    type = "ai_json", mode = session.mode.ifBlank { "online" }, isMe = false,
+                    emotion = normalized.emotion, activity = normalized.state, location = normalized.location
+                ))
+                // 主动消息的状态/位置也要进入连续性，否则下一轮回复会和这条消息自相矛盾。
+                settings.putPrivateTurnState(session.id, com.rhodes.privatechat.shared.model.PrivateTurnState(
+                    emotion = normalized.emotion.ifBlank { turnState?.emotion.orEmpty() },
+                    location = normalized.location.ifBlank { turnState?.location.orEmpty() },
+                    activity = normalized.state.ifBlank { turnState?.activity.orEmpty() },
+                    updatedAt = System.currentTimeMillis(),
+                    currentTopic = normalized.continuity.ifBlank { turnState?.currentTopic.orEmpty() },
+                    unresolvedThread = turnState?.unresolvedThread.orEmpty(),
+                    pendingAction = turnState?.pendingAction.orEmpty(),
+                    userIntentAnalysis = turnState?.userIntentAnalysis.orEmpty(),
+                    userTurnType = turnState?.userTurnType.orEmpty(),
+                    currentAnchor = turnState?.currentAnchor.orEmpty(),
+                    turnAdvance = turnState?.turnAdvance.orEmpty(),
+                    threadStatus = turnState?.threadStatus.orEmpty(),
                 ))
                 unhideSession(session.id)
                 if (currentSession.value?.id != session.id) {
@@ -965,6 +1037,25 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
         }
         return false
     }
+
+    /**
+     * 与上一条 AI 消息是否高度相似。用二元组重合度而不是编辑距离：
+     * 换几个词、调整语序的"换词复述"用编辑距离判定会漏掉，二元组能抓住。
+     */
+    private fun proactiveSimilarToLastAi(candidate: String, lastAi: String): Boolean {
+        val left = candidate.filterNot { it.isWhitespace() || it.isPunctuation() }
+        val right = lastAi.filterNot { it.isWhitespace() || it.isPunctuation() }
+        if (left.length < 8 || right.length < 8) return false
+        if (left == right) return true
+        val leftPairs = left.windowed(2).toSet()
+        val rightPairs = right.windowed(2).toSet()
+        if (leftPairs.isEmpty() || rightPairs.isEmpty()) return false
+        val shared = leftPairs.intersect(rightPairs).size.toDouble()
+        return shared / minOf(leftPairs.size, rightPairs.size) >= 0.75
+    }
+
+    private fun Char.isPunctuation(): Boolean =
+        this in "，。！？、；：\"'“”‘’（）《》…—~,.!?;:()[]{}<>-"
 
     private fun extractProactiveText(content: String): String = try {
         val root = json.parseToJsonElement(content).jsonObject
@@ -1006,11 +1097,14 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
             idleMillis <= 4L * 60 * 60 * 1000L -> "same_day_continuation"
             else -> "same_day_reconnect"
         }
+        val hour = sharedUtils.beijingSdf("H").format(java.util.Date(now)).toIntOrNull() ?: 12
+        val timeOfDay = SharedUtils.getTimeOfDay(hour)
         val relation = when {
-            unresolvedQuestion -> "用户上一条是尚未得到回复的明确提问。"
-            !sameDay -> "跨日：上一轮互动已属于此前一天；不要把当时的场景、时段或道别当作现在仍在发生。"
-            idleMillis <= 4L * 60 * 60 * 1000L -> "同日短暂间隔：可参考上次未自然收束的话题，但不要假装对话没有中断。"
-            else -> "同日间隔较久：以当前时段重新自然联系，不要直接续写已经结束的话题。"
+            unresolvedQuestion -> "用户上一条是尚未得到回复的明确提问。开场必须直接回应这个问题（先给答案，或明确说明什么时候能给），不要先聊别的、也不要再问一遍。"
+            !sameDay -> "跨日：上一轮互动已属于此前一天；不要把当时的场景、时段或道别当作现在仍在发生。开场适合用当前时段（$timeOfDay）的一件具体近况起头。"
+            idleMillis <= 4L * 60 * 60 * 1000L -> "同日短暂间隔：可参考上次未自然收束的话题，但不要假装对话没有中断。只补充一件新的具体事，不要重复刚才已经说过的内容。"
+            idleMillis >= 12L * 60 * 60 * 1000L -> "同日已隔很久：以当前时段（$timeOfDay）重新自然联系，不要直接续写已经结束的话题，也不要翻旧账。"
+            else -> "同日间隔较久：以当前时段（$timeOfDay）的一件具体近况或新发生的事开场，不要直接续写已经结束的话题。"
         }
         val unresolved = if (unresolvedQuestion) "用户问：${lastUserText.take(180)}" else "无"
         val recentHistory = visible.takeLast(6).joinToString("\n") { message ->
@@ -1079,38 +1173,174 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
     }
 
     /** Called from WorkManager after a plan-selected character reaches its individual delivery time. */
-    suspend fun deliverScheduledPrivate(operatorId: String, cycle: String): ScheduledMomentDeliveryResult {
+    suspend fun deliverScheduledPrivate(
+        operatorId: String,
+        cycle: String,
+        deliveryId: String = com.rhodes.privatechat.automation.DailyContentScheduler.DELIVERY_FIRST,
+    ): ScheduledMomentDeliveryResult {
         if (!settings.autoAiEnabled || !settings.idleProactiveChatEnabled) return ScheduledMomentDeliveryResult.SKIPPED
-        val key = "daily_content_private_${cycle}_$operatorId"
+        // 幂等键按"投递编号"区分：同一角色一天的第 1 条和第 2 条是两次独立投递。
+        val key = "daily_content_private_${cycle}_${operatorId}_$deliveryId"
         if (settings.getBoolean(key, false)) return ScheduledMomentDeliveryResult.SUCCEEDED
+        val op = repository.getOperator(operatorId)
+        val label = "${op?.name ?: operatorId}${if (deliveryId == com.rhodes.privatechat.automation.DailyContentScheduler.DELIVERY_SECOND) "第2条" else "第1条"}"
+        fun skip(reason: String): ScheduledMomentDeliveryResult {
+            DailyPlanDiagnostics.recordResult(getApplication(), cycle, "$label 未发送：$reason")
+            return ScheduledMomentDeliveryResult.SKIPPED
+        }
+        if (op == null) return skip("角色不存在")
         val sentKey = "daily_content_private_sent_$cycle"
-        if (settings.getInt(sentKey, 0) >= settings.dailyProactiveMax) return ScheduledMomentDeliveryResult.SKIPPED
-        val op = repository.getOperator(operatorId) ?: return ScheduledMomentDeliveryResult.SKIPPED
+        if (settings.getInt(sentKey, 0) >= settings.dailyProactiveMax) return skip("已达当日上限")
+        val perOperatorKey = "daily_content_private_op_${cycle}_$operatorId"
+        if (settings.getInt(perOperatorKey, 0) >= settings.proactivePerOperatorDailyMax) {
+            return skip("该角色今日已达上限")
+        }
         if (repository.getActiveDispatches().any { dispatch ->
                 dispatch.operatorIds.split(",").map(String::trim).any { it == op.id }
-            }) return ScheduledMomentDeliveryResult.SKIPPED
-        if (!settings.getOperatorMsgPermission(op.id)) return ScheduledMomentDeliveryResult.SKIPPED
-        val session = repository.getSessionByOperator(op.id) ?: return ScheduledMomentDeliveryResult.SKIPPED
+            }) return skip("角色正在派遣中")
+        if (!settings.getOperatorMsgPermission(op.id)) return skip("未开启该角色主动消息权限")
+        val session = repository.getSessionByOperator(op.id) ?: return skip("没有会话")
+        val nowMs = System.currentTimeMillis()
         val lastUser = repository.getLastUserMessageTime(session.id)
-        if (isOperatorQuietAfterUser(lastUser, System.currentTimeMillis())) return ScheduledMomentDeliveryResult.SKIPPED
-        val deliveryKey = "private:$cycle:$operatorId"
+        if (isOperatorQuietAfterUser(lastUser, nowMs)) {
+            return skip("你刚发过消息，静默${settings.proactiveQuietAfterUserMinutes}分钟内不打扰")
+        }
+        if (isOperatorQuietAfterLastMessage(session.lastTime, nowMs)) {
+            DebugLogger.log("Proactive", "跳过主动消息: op=${op.id}, 距上次对话不足${settings.proactiveMinGapMinutes}分钟")
+            return skip("距上次对话不足${settings.proactiveMinGapMinutes}分钟")
+        }
+        val deliveryKey = "private:$cycle:$operatorId:$deliveryId"
         val claimedAt = System.currentTimeMillis()
         if (!repository.claimDailyDelivery(deliveryKey, claimedAt)) return ScheduledMomentDeliveryResult.SUCCEEDED
         val sent = sendProactiveMessage(op)
         if (sent) {
             settings.putBoolean(key, true)
             settings.putInt(sentKey, settings.getInt(sentKey, 0) + 1)
+            settings.putInt(perOperatorKey, settings.getInt(perOperatorKey, 0) + 1)
             repository.completeDailyDelivery(deliveryKey, System.currentTimeMillis())
+            DailyPlanDiagnostics.recordResult(getApplication(), cycle, "$label 已发送")
             val latest = repository.getMessagesSync(session.id).lastOrNull()
+            val preview = latest?.let { extractProactiveText(it.content) }?.take(120).orEmpty()
             if (!RhodesAppVisibility.isForeground) {
                 RhodesNotificationCenter.show(
-                    getApplication(), op.name, latest?.let { extractProactiveText(it.content) }?.take(120).orEmpty(),
-                    session.id, avatarUri = op.avatarUri
+                    getApplication(), op.name, preview, session.id, avatarUri = op.avatarUri
                 )
+            } else if (currentSession.value?.id != session.id) {
+                // 前台只加未读角标时，停在别的页面/会话的玩家完全不会察觉，这里补一个轻提示。
+                android.widget.Toast.makeText(
+                    getApplication(), "${op.name}发来一条消息", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        } else {
+            repository.releaseDailyDelivery(deliveryKey, System.currentTimeMillis())
+            DailyPlanDiagnostics.recordResult(getApplication(), cycle, "$label 生成失败，稍后自动重试")
+        }
+        return if (sent) ScheduledMomentDeliveryResult.SUCCEEDED else ScheduledMomentDeliveryResult.RETRYABLE_FAILURE
+    }
+
+    /**
+     * 主动消息之后"补一句"的投递。
+     *
+     * 只有最后一条消息仍是刚发出的那条主动消息时才补发：玩家一旦回复，补句自动作废，
+     * 避免出现"用户已经回话、角色还在自说自话"的怪异体验。
+     */
+    suspend fun deliverScheduledProactiveFollowUp(
+        operatorId: String,
+        cycle: String,
+        deliveryId: String,
+    ): ScheduledMomentDeliveryResult {
+        if (!settings.autoAiEnabled || !settings.idleProactiveChatEnabled) return ScheduledMomentDeliveryResult.SKIPPED
+        val key = "daily_content_followup_${cycle}_${operatorId}_$deliveryId"
+        if (settings.getBoolean(key, false)) return ScheduledMomentDeliveryResult.SUCCEEDED
+        val sentKey = "daily_content_private_sent_$cycle"
+        if (settings.getInt(sentKey, 0) >= settings.dailyProactiveMax) return ScheduledMomentDeliveryResult.SKIPPED
+        val op = repository.getOperator(operatorId) ?: return ScheduledMomentDeliveryResult.SKIPPED
+        if (!settings.getOperatorMsgPermission(op.id)) return ScheduledMomentDeliveryResult.SKIPPED
+        val session = repository.getSessionByOperator(op.id) ?: return ScheduledMomentDeliveryResult.SKIPPED
+        val messages = repository.getMessagesSync(session.id).filter { it.type != "system" }
+        val last = messages.lastOrNull() ?: return ScheduledMomentDeliveryResult.SKIPPED
+        if (last.isMe || last.type != "ai_json") {
+            DailyPlanDiagnostics.recordResult(getApplication(), cycle, "${op.name}补一句 取消：你已经回复了")
+            return ScheduledMomentDeliveryResult.SKIPPED
+        }
+        if (System.currentTimeMillis() - last.timestamp > FOLLOW_UP_WINDOW_MS) return ScheduledMomentDeliveryResult.SKIPPED
+        val previous = proactiveMessageText(last)
+        if (previous.isBlank()) return ScheduledMomentDeliveryResult.SKIPPED
+        val sent = sendProactiveFollowUp(op, session, previous)
+        if (sent) {
+            settings.putBoolean(key, true)
+            settings.putInt(sentKey, settings.getInt(sentKey, 0) + 1)
+            DailyPlanDiagnostics.recordResult(getApplication(), cycle, "${op.name}补一句 已发送")
+        }
+        return if (sent) ScheduledMomentDeliveryResult.SUCCEEDED else ScheduledMomentDeliveryResult.SKIPPED
+    }
+
+    /** 补一句的生成。刻意不走完整主动消息模板：只要一句新信息，不做状态卡、不重复问候。 */
+    private suspend fun sendProactiveFollowUp(op: Operator, session: ChatSession, previousText: String): Boolean {
+        if (getApiKey().isBlank()) return false
+        val turnState = settings.getPrivateTurnState(session.id)
+        val system = """
+            你刚刚已经给用户发过一条消息，用户还没有回复。现在你在几分钟后又补发了一句。
+            要求：
+            - 只输出这一句话本身，不要任何标签、JSON 或解释。
+            - 必须是新的信息：补充一个细节、一件刚发生的事、或一句不要求回复的关心。
+            - 禁止重复上一条已经说过的内容，禁止换词复述。
+            - 禁止重新问候（不要再“早上好”“晚上好”“在吗”）。
+            - 不要变成连续追问，最多留一个轻松的口子，也可以完全不问。
+            - 长度 8~35 字，比上一条更短。
+            - 不要输出动作、神态、环境描写。
+
+            【角色】
+            你是${op.name}${if (op.title.isNullOrBlank()) "" else "（${op.title}）"}，性别设定：${op.gender.ifBlank { "未设置" }}。
+
+            【人设】
+            ${op.privatePrompt.ifBlank { op.description }}
+        """.trimIndent()
+        val user = """
+            你上一条发的是：$previousText
+
+            【当前信息】
+            时间：${sharedUtils.beijingPromptTime()}
+            关系：${op.userRelation.ifBlank { "未知" }}
+            最近聊天进展：${repository.getShortTermMemory(session.id)?.content ?: "无"}
+
+            请补一句。
+        """.trimIndent()
+        val raw = withTimeout(60_000) {
+            sharedUtils.chat(listOf(AiMessage("system", system), AiMessage("user", user)), "ProactivePrivateFollowUp")
+        }
+        val line = raw.trim().lineSequence()
+            .firstOrNull { it.isNotBlank() }
+            ?.trim()
+            ?.removePrefix("【台词】")
+            ?.trim()
+            .orEmpty()
+            .take(60)
+        if (line.isBlank() || proactiveSimilarToLastAi(line, previousText)) {
+            DebugLogger.log("Proactive/FollowUp", "跳过补句: op=${op.id}, blank=${line.isBlank()}")
+            return false
+        }
+        val response = com.rhodes.privatechat.shared.model.OfflineModeResponse(
+            emotion = turnState?.emotion.orEmpty(),
+            state = turnState?.activity.orEmpty(),
+            location = turnState?.location.orEmpty(),
+            segments = listOf(com.rhodes.privatechat.shared.model.Segment(type = "dialogue", content = line)),
+        )
+        val msgId = repository.getNextMessageId()
+        repository.sendMessage(session.id, ChatMessage(
+            id = msgId, sessionId = session.id, senderName = op.name,
+            content = json.encodeToString(com.rhodes.privatechat.shared.model.OfflineModeResponse.serializer(), response),
+            type = "ai_json", mode = session.mode.ifBlank { "online" }, isMe = false,
+            emotion = response.emotion, activity = response.state, location = response.location,
+        ))
+        unhideSession(session.id)
+        if (currentSession.value?.id != session.id) {
+            repository.incrementUnread(session.id)
+            if (!RhodesAppVisibility.isForeground) {
+                RhodesNotificationCenter.show(getApplication(), op.name, line, session.id, avatarUri = op.avatarUri)
             }
         }
-        if (!sent) repository.releaseDailyDelivery(deliveryKey, System.currentTimeMillis())
-        return if (sent) ScheduledMomentDeliveryResult.SUCCEEDED else ScheduledMomentDeliveryResult.RETRYABLE_FAILURE
+        return true
     }
 
     private fun normalizeProactiveResponse(response: com.rhodes.privatechat.shared.model.OfflineModeResponse): com.rhodes.privatechat.shared.model.OfflineModeResponse {
@@ -1128,6 +1358,17 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
     private fun isOperatorQuietAfterUser(lastUserMsgTime: Long?, now: Long): Boolean {
         val quiet = proactiveQuietAfterUserMs()
         return quiet > 0L && lastUserMsgTime != null && now - lastUserMsgTime < quiet
+    }
+
+    private fun proactiveMinGapMs(): Long = settings.proactiveMinGapMinutes.toLong() * 60_000L
+
+    /**
+     * 距"任意一方最后一条消息"的静默。原来的静默只看玩家发言，所以角色刚回复完几分钟
+     * 就可能又发来一条主动消息，玩家会觉得黏人或像在复读。
+     */
+    private fun isOperatorQuietAfterLastMessage(lastMessageTime: Long?, now: Long): Boolean {
+        val gap = proactiveMinGapMs()
+        return gap > 0L && lastMessageTime != null && lastMessageTime > 0L && now - lastMessageTime < gap
     }
 
     private suspend fun refreshAllOperatorStatus(force: Boolean = false) {
@@ -2123,7 +2364,7 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
                                     "user",
                                     "【重试要求】上一版输出无法作为动态正文保存。请只输出符合字数要求的动态纯文本，不要 JSON、Markdown、解释、前缀或占位符。"
                                 )
-                                val raw = withTimeout(15_000) { chat(attemptMessages, if (attempt == 0) "Moment" else "MomentContentRetry") }
+                                val raw = withTimeout(45_000) { chat(attemptMessages, if (attempt == 0) "Moment" else "MomentContentRetry") }
                                 sharedUtils.trackTokens("moment", attemptMessages, raw)
                                 content = cleanGeneratedContent(raw, settings.momentMinChars, settings.momentMaxChars)
                                 if (content.isNotBlank()) break
@@ -2188,7 +2429,7 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
                 "【重试要求】上一版不是可保存的评论正文。只输出${minChars}~${maxChars}字、与动态正文相关的公开评论；不要 JSON、Markdown、解释、前缀或占位符。"
             )
             try {
-                val raw = withTimeout(10_000) { chat(attemptMessages, if (attempt == 0) logTag else "${logTag}ContentRetry") }
+                val raw = withTimeout(45_000) { chat(attemptMessages, if (attempt == 0) logTag else "${logTag}ContentRetry") }
                 sharedUtils.trackTokens("comment", attemptMessages, raw)
                 cleanGeneratedContent(raw, minChars, maxChars).takeIf { it.isNotBlank() }?.let { return it }
             } catch (e: CancellationException) {
@@ -2330,7 +2571,7 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
                         "user",
                         "【重试要求】上一版输出无法作为动态正文保存。请只输出符合字数要求的动态纯文本，不要 JSON、Markdown、解释、前缀或占位符。"
                     )
-                    val result = withTimeout(15_000) { sharedUtils.chatResult(attemptMessages, if (attempt == 0) "Moment" else "MomentContentRetry") }
+                    val result = withTimeout(45_000) { sharedUtils.chatResult(attemptMessages, if (attempt == 0) "Moment" else "MomentContentRetry") }
                     val raw = result.content
                     onModelResult(result)
                     if (debugOperationId.isNotBlank()) {
@@ -3155,9 +3396,10 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
                 DebugLogger.conversationStep(debugOperationId, "日记", "准备资料", "完成", "已准备日记上下文")
                 DebugLogger.attachOperationModule(debugOperationId, "完整请求", sharedUtils.logAiCallText(diaryMessages), sensitive = true)
                 Log.d("RHODES_DIARY", "请求消息数=${diaryMessages.size}")
-                DebugLogger.conversationStep(debugOperationId, "日记", "模型请求", "进行中", "首次请求，超时25秒")
+                DebugLogger.conversationStep(debugOperationId, "日记", "模型请求", "进行中", "首次请求，超时60秒")
                 var text = try {
-                    withTimeout(25_000) { sharedUtils.chat(diaryMessages) }.trim()
+                    // 日记属于"内容创作"，允许深度思考；思考会先写思维链，因此预算从 25 秒放宽到 60 秒。
+                    withTimeout(60_000) { sharedUtils.chat(diaryMessages, "Diary") }.trim()
                 } catch (e: Exception) {
                     Log.e("RHODES_DIARY", "API调用失败: ${e.message}", e)
                     throw e
@@ -3175,9 +3417,9 @@ ${recentTalk.takeLast(6).joinToString("\n").ifBlank { "暂无" }}
                     DebugLogger.conversationStep(debugOperationId, "日记", "格式检查", "重试", "首次内容不是第一人称日记")
                     val rewriteInstruction = "【重写要求】上一版像第三人称记录，不像日记。请改写成${op.name}本人第一人称日记，全篇用“我”，不要用角色名、她、他或这名干员称呼自己。直接输出日记文本。"
                     val retryMessages = diaryMessages + AiMessage("user", rewriteInstruction)
-                    DebugLogger.conversationStep(debugOperationId, "日记", "模型请求", "进行中", "格式重写，超时25秒")
+                    DebugLogger.conversationStep(debugOperationId, "日记", "模型请求", "进行中", "格式重写，超时60秒")
                     text = PlainGeneratedContentNormalizer.normalize(
-                        raw = withTimeout(25_000) { sharedUtils.chat(retryMessages) }.trim(),
+                        raw = withTimeout(60_000) { sharedUtils.chat(retryMessages, "DiaryContentRetry") }.trim(),
                         minChars = settings.diaryMinChars,
                         maxChars = settings.diaryMaxChars
                     ).orEmpty()

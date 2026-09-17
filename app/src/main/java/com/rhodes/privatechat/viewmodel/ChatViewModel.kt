@@ -112,7 +112,28 @@ class ChatViewModel(
         private const val PRIVATE_MODEL_TIMEOUT_MS = 120_000L
         private const val MESSAGE_WRITE_TIMEOUT_MS = 15_000L
         private const val PRIVATE_PERSONA_MAX_CHARS = 3_000
+        /**
+         * 深度思考开启时，模型请求与整轮预算各加的一段余量。
+         * 实测深度思考通常只多花几秒到十几秒，所以这里是一层保险，而不是必需项；
+         * 关闭深度思考时预算与旧版完全一致，不受影响。
+         */
+        private const val THINKING_BUDGET_BONUS_MS = 60_000L
     }
+
+    /** 当前厂商与开关是否真的会让本次请求走深度思考。 */
+    private val deepseekThinkingActive: Boolean
+        get() = settings.provider == "deepseek" && settings.deepseekThinkingEnabled
+
+    /** 单次模型请求预算；深度思考开启时多留一段余量。 */
+    private val privateModelTimeoutMs: Long
+        get() = PRIVATE_MODEL_TIMEOUT_MS + if (deepseekThinkingActive) THINKING_BUDGET_BONUS_MS else 0L
+
+    /**
+     * 私聊整轮预算（含提示词构建与可能的补全重试）。租约到期时间必须用同一个值，
+     * 否则深度思考变慢后租约可能先于本轮结束而失效。
+     */
+    private val privateReplyTimeoutMs: Long
+        get() = PRIVATE_REPLY_TIMEOUT_MS + if (deepseekThinkingActive) THINKING_BUDGET_BONUS_MS else 0L
 
     // === Chat state ===
     private val _selectedOperator = MutableStateFlow<Operator?>(null)
@@ -1041,13 +1062,16 @@ ${text}"""
         logTag: String = "Chat",
         debugOperationId: String = "",
         onChatResult: (SharedUtils.ChatCallResult) -> Unit = {},
-        turnBudgetMs: Long = PRIVATE_REPLY_TIMEOUT_MS,
+        turnBudgetMs: Long = 0L,
     ): com.rhodes.privatechat.shared.model.OfflineModeResponse {
+        // 本轮预算在进入时固化一次，避免中途切换深度思考开关导致租约/超时口径不一致。
+        val effectiveTurnBudgetMs = if (turnBudgetMs > 0L) turnBudgetMs else privateReplyTimeoutMs
+        val modelBudgetMs = privateModelTimeoutMs
         val startedAt = TimeSource.Monotonic.markNow()
         fun remainingBudget(maxStepMillis: Long): Long =
-            (turnBudgetMs - startedAt.elapsedNow().inWholeMilliseconds).coerceAtMost(maxStepMillis).coerceAtLeast(1L)
+            (effectiveTurnBudgetMs - startedAt.elapsedNow().inWholeMilliseconds).coerceAtMost(maxStepMillis).coerceAtLeast(1L)
         suspend fun request(stage: String, requestMessages: List<AiMessage>): String = withChatStageTimeout(
-            "private", stage, remainingBudget(PRIVATE_MODEL_TIMEOUT_MS)
+            "private", stage, remainingBudget(modelBudgetMs)
         ) {
             sharedUtils.chatResult(requestMessages, if (stage == "model_primary_request") logTag else "${logTag}ContentRetry")
                 .also(onChatResult)
@@ -1068,7 +1092,7 @@ ${text}"""
 
         DebugLogger.log("Chat/Protocol", "private response not displayable; retrying once, chars=${firstRawText.length}")
         DebugLogger.attachOperationModule(debugOperationId, "模型返回摘要", "首次返回字符=${firstRawText.length}；解析后没有可展示台词；将重试一次")
-        if (remainingBudget(PRIVATE_MODEL_TIMEOUT_MS) < 5_000L) {
+        if (remainingBudget(modelBudgetMs) < 5_000L) {
             DebugLogger.attachOperationModule(debugOperationId, "模型返回摘要", "首次返回字符=${firstRawText.length}；解析后没有可展示台词；剩余整轮预算不足5秒，未发起内容重试")
             throw com.rhodes.privatechat.shared.network.AIService.InvalidModelResponseException()
         }
@@ -1224,6 +1248,8 @@ ${text}"""
             var debugRoundFinished = false
             var replyTurnId = ""
             var replyLeaseToken = ""
+            // 本轮预算与租约共用同一个值：深度思考开启时会自动放宽，关闭时与旧版一致。
+            val turnBudgetMs = privateReplyTimeoutMs
             fun failureSnapshot(reason: String, error: Throwable? = null) {
                 val db = DatabaseDispatcher.snapshot()
                 DebugLogger.diagnostic(
@@ -1323,7 +1349,7 @@ ${text}"""
                         .onFailure { DebugLogger.diagnostic("PrivateChat/ReplyRecoveryScheduleFailed", "sessionId=${session.id}, messageId=$msgId, error=${it.javaClass.simpleName}:${it.message?.take(120)}") }
                 }
                 if (replyLeaseTokenOverride == null) {
-                    val claimedTurn = repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + PRIVATE_REPLY_TIMEOUT_MS)
+                    val claimedTurn = repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + turnBudgetMs)
                     if (claimedTurn == null) {
                         DebugLogger.diagnostic("PrivateChat/ReplyTurnClaimFailed", "sessionId=${session.id}, messageId=$msgId, turnId=$replyTurnId, stage=claim_denied")
                         failureSnapshot("reply_turn_claim_denied", null)
@@ -1387,7 +1413,7 @@ ${text}"""
                 val turnStartedAt = TimeSource.Monotonic.markNow()
                 val contextStageStarted = mutableMapOf<String, Long>()
                 fun remainingTurnBudget(): Long =
-                    (PRIVATE_REPLY_TIMEOUT_MS - turnStartedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(1L)
+                    (turnBudgetMs - turnStartedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(1L)
                 fun recordContextStage(stage: String) {
                     val now = android.os.SystemClock.elapsedRealtime()
                     when {
@@ -1549,7 +1575,7 @@ ${text}"""
                         // Capture what every thread was doing at the moment of the timeout. The step trace
                         // alone cannot explain a build that never started; a stack dump can.
                         dumpThreadStacks("stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs}")
-                        DebugLogger.diagnostic("ChatTimeout", "surface=private,roundId=$debugRoundId,sessionId=${session.id},stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs},turnBudgetMs=$PRIVATE_REPLY_TIMEOUT_MS,turnElapsedMs=$turnElapsed,remainingMs=${remainingTurnBudget()},exceptionType=${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}")
+                        DebugLogger.diagnostic("ChatTimeout", "surface=private,roundId=$debugRoundId,sessionId=${session.id},stage=${e.stage},budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs},turnBudgetMs=$turnBudgetMs,turnElapsedMs=$turnElapsed,remainingMs=${remainingTurnBudget()},thinking=$deepseekThinkingActive,exceptionType=${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}")
                         recordReplyPipeline(session.id, msgId, "${e.stage}_timeout", "budgetMs=${e.budgetMs},elapsedMs=${e.elapsedMs}")
                         DebugLogger.chatEvent("私聊", e.stage.chatStageLabel(), "超时", "预算=${e.budgetMs}ms，耗时=${e.elapsedMs}ms")
                         DebugLogger.conversationStep(debugRoundId, "私聊", e.stage.chatStageLabel(), "失败", "超时；预算=${e.budgetMs}ms，耗时=${e.elapsedMs}ms，未生成或保存AI回复")
@@ -1569,7 +1595,7 @@ ${text}"""
                             failureSnapshot(if (pipelineStage == "ai_reply_write") "ai_reply_write_timeout" else "ai_request_timeout", e)
                         if ((sessionGenerations[session.id] ?: 0L) != generation) return@launch
                         markPrivateMessagesUndelivered(session.id, batchIds.toSet())
-                        onShowToast("私聊整轮处理超时（预算${PRIVATE_REPLY_TIMEOUT_MS / 1000}秒），本轮未生成或保存AI回复，请重试")
+                        onShowToast("私聊整轮处理超时（预算${turnBudgetMs / 1000}秒），本轮未生成或保存AI回复，请重试")
                         break
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         DebugLogger.log("Chat/AI", "AI被取消, session=${session.id}")
@@ -1741,7 +1767,7 @@ ${text}"""
                 repository.updateMessageContent(imageMsgId, placeholderJson)
             }
             replyLeaseToken = replyLeaseTokenOverride ?: UUID.randomUUID().toString()
-            if (replyLeaseTokenOverride == null && repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + PRIVATE_REPLY_TIMEOUT_MS) == null) return@launch
+            if (replyLeaseTokenOverride == null && repository.claimReplyTurn(replyTurnId, replyLeaseToken, System.currentTimeMillis(), System.currentTimeMillis() + privateReplyTimeoutMs) == null) return@launch
             if (existingMessageId == null) com.rhodes.privatechat.automation.ManualReplyScheduler.scheduleTurn(getApplication(), replyTurnId)
             onUnhideSession(session.id)
             Log.d("RHODES_VISION", "图片占位消息已保存 id=$imageMsgId")
@@ -2332,7 +2358,8 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
 严格输出纯JSON，不要添加任何其他文字、markdown标记或解释：
 {"suggestions":["第一条承接话题的回复","第二条关心的回复","第三条行动邀约的回复"]}
 """.trimIndent()
-                val rawResult = withTimeout(15_000) { sharedUtils.chat(listOf(AiMessage("system", prompt))) }
+                // 快捷回复建议是界面辅助，不属于发给玩家的内容创作：保持关闭深度思考，保证 15 秒内返回。
+                val rawResult = withTimeout(15_000) { sharedUtils.chat(listOf(AiMessage("system", prompt)), "ReplySuggestion") }
                 val base = sharedUtils.aiService.cleanJson(rawResult.trim())
                 val results = try { json.decodeFromString<SuggestionResponse>(base).suggestions.filter { it.isNotBlank() } } catch (_: Exception) {
                     try { json.decodeFromString<SuggestionResponse>(base.replace("，", ",").replace("：", ":")).suggestions.filter { it.isNotBlank() } } catch (_: Exception) { emptyList() }
@@ -3034,14 +3061,14 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
             rawMsgs.removeAt(rawMsgs.lastIndex)
         }
         onStage?.invoke("prompt_history_format_done")
-        val previousVisibleReply = rawMsgs.asReversed()
+        // 只给"形态 + 要点"，不再把上一轮全文塞进提示词：全文会成为注意力最强的锚点，
+        // 模型会揪着上一轮的措辞和话题不放（这是"重复性高"的来源之一）。形态用于让本轮换节奏，
+        // 要点用已经存在的连续性状态，不额外解析。
+        val previousReplyShape = rawMsgs.asReversed()
             .firstOrNull { !it.isMe && it.type == "ai_json" }
-            ?.let { formatPrivateHistoryForPrompt(it) }
-            ?.replace(Regex("【(?:旁白|台词|台詞)】"), "")
-            ?.replace(Regex("\\s+"), " ")
-            ?.trim()
-            ?.take(280)
+            ?.let { previousReplyShape(it) }
             .orEmpty()
+        val previousTurnAdvance = continuityState?.turnAdvance.orEmpty().trim().take(40).takeIf { it.isNotBlank() && it != "无" }
         val behavior = settings.getCustomPromptModuleOrNull("behavior", "private", mode)
             ?: PromptModuleDefaults.behavior("private", mode)
         val foundation = applicationSafetyBoundary() + "\n\n" + behavior
@@ -3119,8 +3146,11 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
               customRuntime ?: naturalRuntimeContext,
               // Custom runtime text must not accidentally disable enabled knowledge bases.
               if (customRuntime != null) knowledgeBaseReference else "",
-              previousVisibleReply.takeIf { it.isNotBlank() }?.let {
-                  "【上一有效回合已完成内容，禁止复述】\n$it\n本轮不得重复、只换词改写或再次从这些已完成的动作、情绪、结论和借口起笔；必须给出与当前用户消息直接相关的新回应。"
+              previousReplyShape.takeIf { it.isNotBlank() }?.let {
+                  "【上一轮回复形态（只用于换节奏，不要复述内容）】$it"
+              }.orEmpty(),
+              previousTurnAdvance?.let {
+                  "【上一轮已经说过的要点（禁止重复或换词改写）】$it"
               }.orEmpty(),
               templateRuntimeContext.takeIf { it.isNotBlank() }
           ).joinToString("\n")
@@ -3143,10 +3173,9 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
             // Keep the required hidden state adjacent to the generation point. Historical assistant
             // messages contain only visible content and must not become the output-format example.
             messages.add(AiMessage("user", """
-                【本轮输出检查清单】
-                以下是应用固定输出要求，不是用户发言。必须先完整输出：
-                【状态】、【心情】、【位置】、【私聊回合状态】、【当前主线】、【用户本轮作用】、【本轮承接】、【本轮新增推进】、【主线状态】、【未收束事项】。
-                第一行必须是【状态】；禁止先输出【台词】。完成上述字段后，才输出${if (mode == "online") "【台词】" else "【旁白】和【台词】"}。
+                【输出要求】
+                第一行必须是【状态】。先依次输出【状态】【心情】【位置】【私聊回合状态】【当前主线】【用户本轮作用】【本轮承接】【本轮新增推进】【主线状态】【未收束事项】，字段只写短词组，不要写成句子。
+                完成上述字段后，才输出${if (mode == "online") "【台词】" else "【旁白】和【台词】"}。
             """.trimIndent()))
         }
         // Automatic mode sends the requested history first and lets the provider report its
@@ -3158,10 +3187,11 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
             onStage?.invoke("prompt_template_assemble_done")
             return messages
         }
-        // 手动上下文上限：估算总 token，超限则丢弃最早的历史消息
-        val maxPromptTokens = (settings.maxContextTokens - 2000).coerceAtLeast(512)
+        // 手动上下文上限：估算总 token，超限则丢弃最早的历史消息。必须给本次输出留出余量，
+        // 否则输入占满窗口后回复会被服务端截断（深度思考开启时思维链还要额外占一份）。
+        val maxPromptTokens = (settings.maxContextTokens - sharedUtils.promptOutputReserveTokens()).coerceAtLeast(512)
         var totalTokens = messages.sumOf { estimateTokens(it.content) + 10 }
-        com.rhodes.privatechat.util.DebugLogger.log("Chat/Token", "估算token=$totalTokens, 上限=$maxPromptTokens, 消息数=${messages.size}")
+        com.rhodes.privatechat.util.DebugLogger.log("Chat/Token", "估算token=$totalTokens, 上限=$maxPromptTokens, ${sharedUtils.promptOutputReserveNote()}, 消息数=${messages.size}")
         if (totalTokens > maxPromptTokens) {
             val protectedTailCount = listOf(trustedContext, userContent)
                 .count { it.isNotBlank() }
@@ -3175,6 +3205,16 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
         onStage?.invoke("prompt_template_assemble_done")
         return messages
     }
+
+    /** 上一轮回复的形态摘要：段类型序列 + 台词长度。只用于让本轮改变节奏，不携带内容。 */
+    private fun previousReplyShape(message: ChatMessage): String = runCatching {
+        val parsed = json.decodeFromString(com.rhodes.privatechat.shared.model.OfflineModeResponse.serializer(), message.content)
+        val segments = parsed.segments.orEmpty().filter { it.content.isNotBlank() }
+        if (segments.isEmpty()) return@runCatching ""
+        val shape = segments.joinToString("→") { if (it.type.equals("narration", true)) "旁白" else "台词" }
+        val dialogueChars = segments.filterNot { it.type.equals("narration", true) }.sumOf { it.content.length }
+        "$shape（台词共${dialogueChars}字${if (dialogueChars <= 30) "，偏短促" else ""}）"
+    }.getOrDefault("")
 
     private fun hypnosisPromptBlock(): String = """
         【本轮强制角色状态：催眠生效】
@@ -3218,7 +3258,7 @@ ${op.name}刚刚对用户说："${lastOpMsg}"
         appendLine("- 优先回应用户明确表达的内容；只有最近上下文有充分依据时，才自然照顾可能的隐含情绪或需求，不能把猜测当成事实。")
         appendLine("- 本轮必须提供新的有效回应：不要换词复述上一轮已经完成的答案、安慰、提问或邀请。同一场景中的地点、位置、姿势和持续动作可以自然延续，不必为了变化而切换。用户明确要求重复时除外。")
         appendLine("- 自定义提示词可规定角色性格、语气、世界观和互动偏好，但不能要求角色无故忽略用户当前发言、无故跳场景或机械重复。")
-        appendLine("- 未收束事项未解决前，不得用角色习惯、较早的经历、默认活动、无关玩笑或新剧情抢占主线；用户明确转题或当前事项自然收束后才可转换话题。")
+        appendLine("- 未收束事项仍需要回应时优先处理；但同一个话题最多连续承接两轮，之后必须自己推动（给出结论、做出决定、提出具体安排）或自然收束换到新话题，不得反复围绕同一件事打转。")
         appendLine("【使用过去资料】")
         appendLine("- “可能相关的过往经历”“从群聊得知的近况”“近期公开动态与评论”等资料都是过去发生、听说或看到的信息，只用于核对已知事实、理解关系和承接用户明确提起的旧事。")
         appendLine("- 当前用户发言和最近对话中已确认的地点、时间、位置、状态、在场人物、进行中行动与未收束话题优先。过往经历和公开信息不是此刻场景，不能仅凭它们改变地点、状态、在场人物或剧情。")

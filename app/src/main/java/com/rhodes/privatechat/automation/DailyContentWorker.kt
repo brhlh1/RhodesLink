@@ -11,6 +11,7 @@ import com.rhodes.privatechat.viewmodel.ScheduledMomentDeliveryResult
 import com.rhodes.privatechat.viewmodel.shared.AppStateHolder
 import com.rhodes.privatechat.viewmodel.shared.OperatorStateUpdater
 import com.rhodes.privatechat.viewmodel.shared.SharedUtils
+import com.rhodes.privatechat.util.DebugLogger
 import com.rhodes.privatechat.data.backup.BackupRestoreMaintenance
 import org.koin.java.KoinJavaComponent.get
 
@@ -33,14 +34,18 @@ class DailyContentWorker(context: Context, params: WorkerParameters) : Coroutine
                 get<OperatorStateUpdater>(OperatorStateUpdater::class.java), startBackgroundWork = false
             )
             val operatorId = inputData.getString("operatorId") ?: return Result.success()
-            val deliveryId = inputData.getString("deliveryId") ?: "0"
+            val deliveryId = inputData.getString("deliveryId") ?: DailyContentScheduler.DELIVERY_FIRST
             val cycle = inputData.getString("cycle") ?: DailyContentScheduler.cycleId()
             // One-time work can be delayed by network constraints or backoff. Daily content must
             // never be delivered into a later Beijing calendar day.
-            if (cycle != DailyContentScheduler.cycleId()) return Result.success()
+            if (cycle != DailyContentScheduler.cycleId()) {
+                DebugLogger.diagnostic("DailyContent/CrossDayDrop", "type=${inputData.getString("type")},operatorId=$operatorId,deliveryId=$deliveryId,cycle=$cycle,now=${DailyContentScheduler.cycleId()}")
+                return Result.success()
+            }
             val result = when (inputData.getString("type")) {
                 DailyContentScheduler.TYPE_MOMENT -> viewModel.deliverScheduledMoment(operatorId, cycle, deliveryId)
-                DailyContentScheduler.TYPE_PRIVATE -> viewModel.deliverScheduledPrivate(operatorId, cycle)
+                DailyContentScheduler.TYPE_PRIVATE -> viewModel.deliverScheduledPrivate(operatorId, cycle, deliveryId)
+                DailyContentScheduler.TYPE_PRIVATE_FOLLOW_UP -> viewModel.deliverScheduledProactiveFollowUp(operatorId, cycle, deliveryId)
                 else -> ScheduledMomentDeliveryResult.SKIPPED
             }
             if (BackupRestoreMaintenance.active) return Result.success()

@@ -56,12 +56,24 @@ data class Usage(
     @SerialName("completion_tokens") val completionTokens: Int = 0,
     @SerialName("total_tokens") val totalTokens: Int = 0,
     @SerialName("prompt_cache_hit_tokens") val promptCacheHitTokens: Int? = null,
-    @SerialName("prompt_cache_miss_tokens") val promptCacheMissTokens: Int? = null
+    @SerialName("prompt_cache_miss_tokens") val promptCacheMissTokens: Int? = null,
+    /**
+     * 思维链 token 明细。DeepSeek 官方文档并未承诺该字段，OpenAI 兼容服务商可能返回也可能不返回，
+     * 因此保持可空：缺失时调用方按 reasoning_content 长度做“估算”，绝不把估算值当成服务端统计。
+     */
+    @SerialName("completion_tokens_details") val completionTokensDetails: CompletionTokensDetails? = null
+)
+
+@Serializable
+data class CompletionTokensDetails(
+    @SerialName("reasoning_tokens") val reasoningTokens: Int? = null
 )
 
 @Serializable
 data class NonStreamChoice(
-    val message: AiMessage? = null
+    val message: AiMessage? = null,
+    /** "stop" 正常结束；"length" 说明输出被 max_tokens 截断，用于判断是否需要调整输出预算。 */
+    @SerialName("finish_reason") val finishReason: String? = null
 )
 
 @Serializable

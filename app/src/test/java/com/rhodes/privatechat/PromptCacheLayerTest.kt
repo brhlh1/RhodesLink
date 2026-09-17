@@ -333,7 +333,36 @@ class PromptCacheLayerTest {
 
     @Test
     fun promptTemplateVersionAdvancesForTheCurrentPromptRevision() {
-        assertEquals(35, PromptTemplates.VERSION)
+        // 36：主动消息模板改为"必须具体、禁空泛开场、去掉本轮简述"。
+        // 37：私聊/群聊模板补充语域与"只写确认过的现场"，需要推送给没有自定义过提示词的玩家。
+        assertEquals(37, PromptTemplates.VERSION)
+    }
+
+    @Test
+    fun chatPromptsCarryTheHumanLikeBehaviourLayer() {
+        val privateBehavior = com.rhodes.privatechat.viewmodel.PromptModuleDefaults.behavior("private", "offline")
+        val groupBehavior = com.rhodes.privatechat.viewmodel.PromptModuleDefaults.behavior("group", "offline")
+        listOf("private" to privateBehavior, "group" to groupBehavior).forEach { (surface, text) ->
+            assertTrue("$surface 必须有说话方式", text.contains("【说话方式（和内容同等重要）】"))
+            assertTrue("$surface 必须有陪伴基调/群聊陪伴基调", text.contains("陪伴基调"))
+            assertTrue("$surface 必须禁止把话头推回去", text.contains("把话头推回"))
+            assertTrue("$surface 必须限制凭空补现场", text.contains("只能写你确认过的现场"))
+            assertTrue("$surface 必须有冲突优先级", text.contains("【冲突时的优先级】"))
+        }
+        assertTrue("私聊必须有每轮四问", privateBehavior.contains("【每轮开口前先过一遍（内部，不要写出来）】"))
+        assertTrue("私聊必须有信号表", privateBehavior.contains("【怎么读用户这句话（按信号走，不要过度分析）】"))
+        assertTrue("私聊必须有话题生命周期", privateBehavior.contains("【话题的生命周期】"))
+        assertTrue("群聊必须有信号表", groupBehavior.contains("【怎么读用户这句话（按信号走）】"))
+    }
+
+    @Test
+    fun proactiveTemplateForbidsVagueOpeningsAndRequiresConcreteMaterial() {
+        val template = PromptTemplates.get("private", "proactive")
+        assertTrue("必须禁止空泛开场", template.contains("严禁空泛开场"))
+        assertTrue("必须要求具体锚点", template.contains("具体锚点"))
+        assertTrue("必须禁止复读上一条", template.contains("不得复述你上一条"))
+        assertTrue("必须带长期印象", template.contains("{{LONG_TERM_IMPRESSION}}"))
+        assertFalse("不再要求写内部简述，省下输出预算", template.contains("本轮简述"))
     }
 
     @Test

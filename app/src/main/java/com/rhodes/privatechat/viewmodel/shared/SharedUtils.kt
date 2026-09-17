@@ -22,6 +22,8 @@ internal object CachePromptLayering {
         "USER_GENDER" to "用户性别",
         "USER_BIO" to "用户设定",
         "SHORT_TERM_SUMMARY" to "最近聊天进展",
+        "LONG_TERM_IMPRESSION" to "长期印象",
+        "USER_RELATION" to "与用户的关系",
         "PRIVATE_CONTINUITY_STATE" to "当前对话进展",
         "MEMORY_V2_CONTEXT" to "可能相关的过往经历",
         "MEMORY_ANCHORS" to "可能相关的过往经历",
@@ -229,6 +231,14 @@ class SharedUtils(
             hour in 22..23 -> "深夜"
             else -> "凌晨"
         }
+
+        /**
+         * 手动“上下文长度上限”模式下为**输出**预留的 token 数。
+         * 输入侧把窗口塞满会让回复被截断（部分厂商还会直接报错），所以普通模式预留 2000；
+         * 深度思考会先写思维链、思维链同样占用输出预算，因此再多留一份。
+         */
+        fun thinkingAwareOutputReserveTokens(provider: String, thinkingEnabled: Boolean): Int =
+            if (provider == "deepseek" && thinkingEnabled) 4_000 else 2_000
     }
 
     /** Keeps public social context small: specified people, the last three days, and related items only. */
@@ -279,7 +289,23 @@ class SharedUtils(
         val outputTokens: Int,
         val promptCacheHitTokens: Int?,
         val promptCacheMissTokens: Int?,
+        /** 服务端单独统计的思维链 token；服务商未返回该字段时为 null。 */
+        val reasoningTokens: Int? = null,
+        /** 思维链字符数；用于服务端未返回统计时估算与诊断。 */
+        val reasoningChars: Int = 0,
+        /** 服务端结束原因（stop/length/...）；"length" 表示输出被上限截断。 */
+        val finishReason: String? = null,
     ) {
+        /**
+         * 思维链占用，只用于诊断展示，绝不包含思维链原文。
+         * 服务端未返回 reasoning_tokens 时给出上界估算并明确标注，避免让用户以为这是计费统计。
+         */
+        fun reasoningSummary(): String = when {
+            reasoningChars <= 0 -> "无"
+            reasoningTokens != null -> "服务端统计=${reasoningTokens} token（思维链字符数=$reasoningChars）"
+            else -> "服务端未返回统计；思维链字符数=$reasoningChars，上限估算≈${(reasoningChars * 0.6).toInt()} token"
+        }
+
         fun cacheSummary(): String = when {
             promptCacheHitTokens == null && promptCacheMissTokens == null -> "服务端未返回缓存统计"
             promptCacheHitTokens == null || promptCacheMissTokens == null -> "服务端返回的提示词缓存统计不完整"
@@ -298,6 +324,10 @@ class SharedUtils(
         private var callsWithIncompleteUsage = 0L
         private var hitTokens = 0L
         private var missTokens = 0L
+        private var callsWithReasoning = 0L
+        private var reasoningTokens = 0L
+        private var reasoningChars = 0L
+        private var lastFinishReason: String? = null
 
         fun record(result: ChatCallResult) {
             if (result.promptCacheHitTokens == null && result.promptCacheMissTokens == null) {
@@ -309,15 +339,35 @@ class SharedUtils(
                 hitTokens += result.promptCacheHitTokens.toLong()
                 missTokens += result.promptCacheMissTokens.toLong()
             }
+            // 思考模式的思维链占用单独累计，避免用户把“输出Token”整体误当成可见回复的长度。
+            if (result.reasoningChars > 0) {
+                callsWithReasoning++
+                reasoningChars += result.reasoningChars.toLong()
+                reasoningTokens += (result.reasoningTokens ?: (result.reasoningChars * 0.6).toInt()).toLong()
+            }
+            result.finishReason?.let { lastFinishReason = it }
+        }
+
+        /** 思考模式相关的附加诊断；未使用思考模式时为空字符串，保持原有文案不变。 */
+        private fun thinkingSuffix(): String {
+            val parts = mutableListOf<String>()
+            if (callsWithReasoning > 0L) {
+                parts += "思维链占用≈${reasoningTokens}token（$callsWithReasoning 次返回思维链，字符数=$reasoningChars；服务商未单独给出统计时按字符估算，不是计费凭证）"
+            }
+            if (lastFinishReason == "length") {
+                parts += "注意：最后一次输出被服务端长度上限截断（finish_reason=length），回复可能不完整"
+            }
+            return if (parts.isEmpty()) "" else "；" + parts.joinToString("；")
         }
 
         fun summary(): String {
             val total = hitTokens + missTokens
-            return when {
+            val base = when {
                 callsWithUsage == 0L && callsWithoutUsage == 0L && callsWithIncompleteUsage == 0L -> "本轮未收到模型用量"
                 callsWithUsage == 0L -> "成功返回调用=${callsWithoutUsage + callsWithIncompleteUsage}；服务端未返回完整提示词缓存统计"
                 else -> "本轮成功返回调用：完整统计=$callsWithUsage；未返回=$callsWithoutUsage；不完整=$callsWithIncompleteUsage；提示词缓存Token：命中=$hitTokens；未命中=$missTokens；命中率=${if (total > 0) hitTokens * 100 / total else 0}%（含重试/补全；超时或失败请求未计入）"
             }
+            return base + thinkingSuffix()
         }
     }
 
@@ -338,9 +388,13 @@ class SharedUtils(
                 settings.apiKey, messages, settings.provider, settings.modelName, settings.customUrl,
                 temperature = temp, maxOutputTokens = maxOutputTokens, requestType = logTag
             )
-            val callResult = ChatCallResult(result.content, result.inputTokens, result.outputTokens, result.promptCacheHitTokens, result.promptCacheMissTokens)
+            val callResult = ChatCallResult(
+                result.content, result.inputTokens, result.outputTokens,
+                result.promptCacheHitTokens, result.promptCacheMissTokens,
+                result.reasoningTokens, result.reasoningChars, result.finishReason
+            )
             val cacheSummary = callResult.cacheSummary()
-            DebugLogger.log("AI/$logTag/响应", "模型请求成功\n耗时=${startedAt.elapsedNow().inWholeMilliseconds}ms\n输入Token=${result.inputTokens}\n输出Token=${result.outputTokens}\n输出字符=${result.content.length}\n提示词缓存=$cacheSummary")
+            DebugLogger.log("AI/$logTag/响应", "模型请求成功\n耗时=${startedAt.elapsedNow().inWholeMilliseconds}ms\n输入Token=${result.inputTokens}\n输出Token=${result.outputTokens}\n思考Token=${callResult.reasoningSummary()}\n结束原因=${result.finishReason ?: "未返回"}\n输出字符=${result.content.length}\n提示词缓存=$cacheSummary")
             logDeepSeekReasoning(logTag, result)
             logAiResponse(logTag, result.content)
             callResult
@@ -554,15 +608,15 @@ class SharedUtils(
     private fun logDeepSeekReasoning(logTag: String, result: AIService.ChatResult) {
         if (settings.provider != "deepseek") return
         val reasoning = result.reasoningContent.orEmpty()
+        // 思考过程属于模型内部推理，用户既不该在界面上看到，也不该在导出的调试日志里看到。
+        // 这里只保留“是否存在 / 长度 / token 用量”，绝不写入思维链原文。
         DebugLogger.log(
             "AI/$logTag/思维链状态",
             "请求 thinking.type=${if (result.thinkingDisabled) "disabled" else "未显式设置"}\n" +
                 "响应 reasoning_content_present=${reasoning.isNotBlank()}\n" +
-                "reasoning_content_chars=${reasoning.length}",
+                "reasoning_content_chars=${reasoning.length}\n" +
+                "思维链原文不写入日志（只保留状态与用量）",
         )
-        if (reasoning.isNotBlank()) {
-            DebugLogger.trace("AI/$logTag/思维链", "【DeepSeek reasoning_content】\n$reasoning")
-        }
     }
 
     /** Keeps fixed prompt rules separate from volatile, potentially untrusted runtime data. */
@@ -680,6 +734,21 @@ class SharedUtils(
             else -> 2_500
         }
         return (base * weight).coerceAtLeast(200)
+    }
+
+    /**
+     * 手动“上下文长度上限”模式下，为模型本次输出预留的 token 数。
+     * 输入侧裁剪必须给输出留位置：把窗口全部塞满输入，会让回复被服务端截断，甚至在部分厂商直接报错。
+     * 开启 DeepSeek 深度思考时，模型要先写思维链再写回复，思维链同样占用输出预算，因此多留一份余量。
+     */
+    fun promptOutputReserveTokens(): Int =
+        thinkingAwareOutputReserveTokens(settings.provider, settings.deepseekThinkingEnabled)
+
+    /** 诊断文案：说明本次裁剪为输出预留了多少 token。 */
+    fun promptOutputReserveNote(): String {
+        val reserve = promptOutputReserveTokens()
+        val thinking = settings.provider == "deepseek" && settings.deepseekThinkingEnabled
+        return "为输出预留${reserve}token${if (thinking) "（已开启深度思考，额外预留思维链空间）" else ""}"
     }
 
     fun beijingSdf(pattern: String) = java.text.SimpleDateFormat(pattern, java.util.Locale.getDefault())

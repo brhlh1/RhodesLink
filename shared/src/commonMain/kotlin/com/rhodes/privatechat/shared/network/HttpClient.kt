@@ -20,9 +20,11 @@ fun createHttpClient(): HttpClient = HttpClient(createPlatformEngine()) {
     }
     install(HttpTimeout) {
         // Feature-level deadlines own chat timing; transport must not fail first with a generic error.
-        requestTimeoutMillis = 180_000
+        // 深度思考开启时私聊模型预算为 180s、群聊为 210s，因此传输层上限必须高于它们，
+        // 否则用户只会看到一个通用的网络超时，而不是可诊断的业务超时。
+        requestTimeoutMillis = TRANSPORT_TIMEOUT_MS
         connectTimeoutMillis = 30_000
-        socketTimeoutMillis = 180_000
+        socketTimeoutMillis = TRANSPORT_TIMEOUT_MS
     }
 }
 
@@ -35,9 +37,15 @@ fun createHttpClient(block: HttpClientConfig<*>.() -> Unit): HttpClient = HttpCl
         })
     }
     install(HttpTimeout) {
-        requestTimeoutMillis = 180_000
+        requestTimeoutMillis = TRANSPORT_TIMEOUT_MS
         connectTimeoutMillis = 30_000
-        socketTimeoutMillis = 180_000
+        socketTimeoutMillis = TRANSPORT_TIMEOUT_MS
     }
     block()
 }
+
+/**
+ * 传输层上限。只放宽、不收紧：各业务阶段仍用自己的预算提前结束请求，
+ * 这里只保证“业务还没超时，网络不会先失败”。
+ */
+private const val TRANSPORT_TIMEOUT_MS = 240_000L

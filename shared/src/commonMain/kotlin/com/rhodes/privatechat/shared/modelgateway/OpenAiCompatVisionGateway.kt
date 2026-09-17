@@ -1,5 +1,6 @@
 package com.rhodes.privatechat.shared.modelgateway
 
+import com.rhodes.privatechat.shared.model.ThinkingParam
 import com.rhodes.privatechat.shared.network.createHttpClient
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.header
@@ -32,7 +33,7 @@ class OpenAiCompatVisionGateway(
             setBody(VisionChatRequest(modelName, listOf(VisionChatMessage(content = listOf(
                 VisionPart(type = "image_url", imageUrl = VisionImageUrl(request.imageUrlOrBase64)),
                 VisionPart(type = "text", text = request.prompt)
-            )))))
+            ))), thinking = visionThinkingParam()))
         }
         val raw = response.bodyAsText()
         if (!response.status.isSuccess()) {
@@ -44,6 +45,14 @@ class OpenAiCompatVisionGateway(
         if (text.isBlank()) error("识图服务没有返回文字内容: ${raw.take(500)}")
         return VisionAnalyzeResponse(text)
     }
+
+    /**
+     * 识图只是一次工具调用，不是角色回复：DeepSeek 默认开启思考模式，会明显变慢变贵，
+     * 而且一旦 content 为空，下面的兜底逻辑会把思维链当成“画面描述”交给角色和用户看。
+     * 因此对 DeepSeek 显式关闭思考；其它服务商保持不传该字段（与原行为一致）。
+     */
+    private fun visionThinkingParam(): ThinkingParam? =
+        if (endpoint.contains("deepseek", ignoreCase = true)) ThinkingParam("disabled") else null
 
     private fun extractText(raw: String): String {
         val message = json.parseToJsonElement(raw).jsonObject["choices"]
@@ -60,6 +69,8 @@ class OpenAiCompatVisionGateway(
             }
             else -> ""
         }
+        // 最后兜底：个别服务商只把答案放在 reasoning_content 里。这里只在 content 完全为空时使用，
+        // 并且现在 DeepSeek 已关闭思考，所以不会把思维链当作画面描述展示给用户。
         return content.ifBlank { message["reasoning_content"]?.jsonPrimitive?.textOrEmpty().orEmpty() }
     }
 
@@ -70,7 +81,11 @@ class OpenAiCompatVisionGateway(
 
 private fun JsonPrimitive.textOrEmpty(): String = if (this is JsonNull) "" else content
 
-@Serializable private data class VisionChatRequest(val model: String, val messages: List<VisionChatMessage>)
+@Serializable private data class VisionChatRequest(
+    val model: String,
+    val messages: List<VisionChatMessage>,
+    val thinking: ThinkingParam? = null,
+)
 @Serializable private data class VisionChatMessage(val role: String = "user", val content: List<VisionPart>)
 @Serializable private data class VisionPart(val type: String, val text: String? = null, @kotlinx.serialization.SerialName("image_url") val imageUrl: VisionImageUrl? = null)
 @Serializable private data class VisionImageUrl(val url: String)

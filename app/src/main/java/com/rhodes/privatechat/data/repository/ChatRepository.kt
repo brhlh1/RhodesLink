@@ -240,10 +240,7 @@ class ChatRepository(
 
     suspend fun deleteMahjongSave() = shared.deleteMahjongSave()
 
-    suspend fun getLastUserMessageTime(sessionId: String): Long? {
-        val msgs = shared.getMessagesSync(sessionId)
-        return msgs.filter { it.isMe }.maxOfOrNull { it.timestamp }
-    }
+    suspend fun getLastUserMessageTime(sessionId: String): Long? = shared.getLastUserMessageTime(sessionId)
 
     suspend fun getSessionByOperator(operatorId: String): ChatSession? =
         shared.getSessionByOperator(operatorId)

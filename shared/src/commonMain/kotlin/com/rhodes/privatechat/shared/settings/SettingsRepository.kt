@@ -198,7 +198,9 @@ class SettingsRepository(private val settings: ObservableSettings) {
         set(value) = putInt("impression_threshold", value.coerceIn(5, 500))
 
     var historyMessages: Int
-        get() = getInt("history_messages", 30).coerceIn(0, 200)
+        // 30 轮历史（每条最多 1400 字）会让模型大量模仿自己过去的句式，越聊越像模板。
+        // 15 轮足够维持承接感，同时显著降低"回声室"效应；玩家仍可在设置里自行调高。
+        get() = getInt("history_messages", 15).coerceIn(0, 200)
         set(value) = putInt("history_messages", value.coerceIn(0, 200))
 
     var maxContextTokens: Int
@@ -741,12 +743,49 @@ class SettingsRepository(private val settings: ObservableSettings) {
         set(value) = settings.putInt("daily_moment_target", value.coerceIn(0, 3))
 
     var dailyProactiveChance: Int
-        get() = settings.getInt("daily_proactive_chance", 80).coerceIn(0, 100)
+        get() = settings.getInt("daily_proactive_chance", 100).coerceIn(0, 100)
         set(value) = settings.putInt("daily_proactive_chance", value.coerceIn(0, 100))
 
+    /**
+     * 每天最多发出几条主动私聊消息。
+     *
+     * 语义在 2.x 起从"每天最多几个角色"改为"每天最多几条消息"：允许同一角色一天说两句话之后，
+     * 只有"条数"才能真实反映打扰程度。旧键值继续沿用，玩家调过的数字不会被重置。
+     */
     var dailyProactiveMax: Int
-        get() = settings.getInt("daily_proactive_max", 5).coerceIn(0, 20)
-        set(value) = settings.putInt("daily_proactive_max", value.coerceIn(0, 20))
+        get() = settings.getInt("daily_proactive_max", 8).coerceIn(0, 30)
+        set(value) = settings.putInt("daily_proactive_max", value.coerceIn(0, 30))
+
+    /** 同一角色一天最多主动几次。 */
+    var proactivePerOperatorDailyMax: Int
+        get() = settings.getInt("proactive_per_operator_daily_max", 2).coerceIn(1, 5)
+        set(value) = settings.putInt("proactive_per_operator_daily_max", value.coerceIn(1, 5))
+
+    /** 主动消息发出后，同一角色再补一句的概率（百分比）。0 表示不补。 */
+    var proactiveFollowUpChance: Int
+        get() = settings.getInt("proactive_followup_chance", 15).coerceIn(0, 100)
+        set(value) = settings.putInt("proactive_followup_chance", value.coerceIn(0, 100))
+
+    /**
+     * 距"任意一方最后一条消息"至少间隔多少分钟才允许主动联系。
+     *
+     * 与 [proactiveQuietAfterUserMinutes] 的区别：那个只看玩家自己的发言，这个两边都看。
+     * 只按玩家发言判断时，角色刚回复完几分钟就可能又发来一条，玩家会觉得黏人或复读。
+     */
+    var proactiveMinGapMinutes: Int
+        get() = settings.getInt("proactive_min_gap_minutes", 45).coerceIn(0, 1440)
+        set(value) = settings.putInt("proactive_min_gap_minutes", value.coerceIn(0, 1440))
+
+    /**
+     * 主动消息权限的全局默认值，未单独设置过的角色跟随它。
+     *
+     * 早期版本在首次安装时把所有角色的权限批量写成"无授权"，147 个内置角色里只有 10 个会主动联系，
+     * 玩家几乎感知不到这个功能。改为跟随全局后，这类由应用批量写入的历史值不再永久生效；
+     * 玩家自己动过的开关会被标记为"显式设置"，永远优先。
+     */
+    var proactivePermissionAll: Boolean
+        get() = settings.getBoolean("proactive_permission_all", true)
+        set(value) = settings.putBoolean("proactive_permission_all", value)
 
     var quietHoursEnabled: Boolean
         get() = getBoolean("quiet_hours_enabled", false)
@@ -1043,10 +1082,24 @@ class SettingsRepository(private val settings: ObservableSettings) {
     // === 动态键方法（per-operator, per-group）===
 
     fun getOperatorMsgPermission(operatorId: String): Boolean =
-        getBoolean("msg_$operatorId", true)
+        resolveMsgPermission(
+            explicit = hasOperatorMsgPermissionOverride(operatorId),
+            storedValue = getBoolean("msg_$operatorId", true),
+            globalDefault = proactivePermissionAll,
+        )
 
-    fun putOperatorMsgPermission(operatorId: String, value: Boolean) =
+    /** 玩家是否单独设置过这个角色的主动消息权限；只有这类设置才永久优先于全局开关。 */
+    fun hasOperatorMsgPermissionOverride(operatorId: String): Boolean =
+        getBoolean("msg_${operatorId}_explicit", false)
+
+    /**
+     * 写入角色主动消息权限。默认同时记为"显式设置"（界面上手动切换就是这个语义），
+     * 备份恢复时按原样回填显式值，避免恢复后的权限被全局开关悄悄改掉。
+     */
+    fun putOperatorMsgPermission(operatorId: String, value: Boolean, explicit: Boolean = true) {
         putBoolean("msg_$operatorId", value)
+        if (explicit) putBoolean("msg_${operatorId}_explicit", true)
+    }
 
     fun getOperatorDynPermission(operatorId: String): Boolean =
         getBoolean("dyn_$operatorId", true)
@@ -1425,8 +1478,13 @@ class SettingsRepository(private val settings: ObservableSettings) {
                 putInt("group_member_memory_count", 1)
                 putInt("event_context_count", 2)
                 putInt("daily_moment_target", 1)
-                putInt("daily_proactive_chance", 40)
-                putInt("daily_proactive_max", 1)
+                // 省流档：主动消息保持克制（3 条/天），不补句、间隔更长。动态相关设置不动。
+                putInt("daily_proactive_chance", 60)
+                putInt("daily_proactive_max", 3)
+                putInt("proactive_per_operator_daily_max", 1)
+                putInt("proactive_followup_chance", 0)
+                putInt("proactive_min_gap_minutes", 90)
+                putInt("proactive_quiet_after_user_minutes", 20)
                 idleProactiveChatEnabled = true
                 quietHoursEnabled = true
                 momentMemoryV2Enabled = false
@@ -1443,8 +1501,13 @@ class SettingsRepository(private val settings: ObservableSettings) {
                 putInt("group_member_memory_count", 2)
                 putInt("event_context_count", 5)
                 putInt("daily_moment_target", 1)
-                putInt("daily_proactive_chance", 70)
-                putInt("daily_proactive_max", 3)
+                // 标准档（推荐）：每天 8 条上限，最多 6 个角色、其中 2 个会说两句。
+                putInt("daily_proactive_chance", 100)
+                putInt("daily_proactive_max", 8)
+                putInt("proactive_per_operator_daily_max", 2)
+                putInt("proactive_followup_chance", 15)
+                putInt("proactive_min_gap_minutes", 45)
+                putInt("proactive_quiet_after_user_minutes", 15)
                 idleProactiveChatEnabled = true
                 quietHoursEnabled = true
                 momentMemoryV2Enabled = true
@@ -1461,8 +1524,13 @@ class SettingsRepository(private val settings: ObservableSettings) {
                 putInt("group_member_memory_count", 2)
                 putInt("event_context_count", 8)
                 putInt("daily_moment_target", 3)
-                putInt("daily_proactive_chance", 90)
-                putInt("daily_proactive_max", 5)
+                // 完整档：最热闹，但仍然有总量与间隔闸门，避免刷屏。
+                putInt("daily_proactive_chance", 100)
+                putInt("daily_proactive_max", 12)
+                putInt("proactive_per_operator_daily_max", 2)
+                putInt("proactive_followup_chance", 30)
+                putInt("proactive_min_gap_minutes", 25)
+                putInt("proactive_quiet_after_user_minutes", 10)
                 idleProactiveChatEnabled = true
                 quietHoursEnabled = true
                 momentMemoryV2Enabled = true
@@ -1476,4 +1544,15 @@ class SettingsRepository(private val settings: ObservableSettings) {
 
     fun clear() =
         settings.clear()
+
+    companion object {
+        /**
+         * 主动消息权限解析：玩家显式设置过就听玩家的，否则跟随全局开关。
+         *
+         * 纯函数，便于单元测试。之所以需要它：早期版本在首次安装时把 147 个角色的权限批量写成
+         * "无授权"，如果继续把数据库里的旧值当成玩家的真实意愿，绝大多数角色永远不会主动联系。
+         */
+        fun resolveMsgPermission(explicit: Boolean, storedValue: Boolean, globalDefault: Boolean): Boolean =
+            if (explicit) storedValue else globalDefault
+    }
 }
