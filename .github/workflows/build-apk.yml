@@ -85,10 +85,18 @@ jobs:
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
+      # ===== 修复1：给项目加上官方仓库（阿里云镜像缺少 Kotlin Compose 插件）=====
+      - name: 修复 Gradle 仓库源（加官方插件门户与 google 源）
+        run: |
+          sed -i 's#maven { setUrl("https://maven.aliyun.com/repository/gradle-plugin") }#maven { setUrl("https://maven.aliyun.com/repository/gradle-plugin") }\n        gradlePluginPortal()#' settings.gradle.kts
+          sed -i 's#mavenCentral()#google()\n        mavenCentral()#' settings.gradle.kts
+          echo "===== 修改后的 settings.gradle.kts ====="
+          cat settings.gradle.kts
+
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
 
-      # ===== 修复：创建 local.properties（提供签名密码，否则 APK 签名会失败）=====
+      # ===== 修复2：创建 local.properties（提供签名密码）=====
       - name: 创建 local.properties
         run: |
           echo "KEYSTORE_PASSWORD=rhodes2026" > local.properties
