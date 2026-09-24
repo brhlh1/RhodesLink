@@ -85,12 +85,29 @@ jobs:
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
-      # ===== 修复1：给项目加上官方仓库（阿里云镜像缺少 Kotlin Compose 插件）=====
-      - name: 修复 Gradle 仓库源（加官方插件门户与 google 源）
+      # ===== 修复1：重写 settings.gradle.kts，移除国内镜像（GitHub 海外服务器访问会卡住）=====
+      - name: 修复 Gradle 仓库源（改用官方源）
         run: |
-          sed -i 's#maven { setUrl("https://maven.aliyun.com/repository/gradle-plugin") }#maven { setUrl("https://maven.aliyun.com/repository/gradle-plugin") }\n        gradlePluginPortal()#' settings.gradle.kts
-          sed -i 's#mavenCentral()#google()\n        mavenCentral()#' settings.gradle.kts
-          echo "===== 修改后的 settings.gradle.kts ====="
+          printf '%s\n' \
+            'pluginManagement {' \
+            '    repositories {' \
+            '        google()' \
+            '        mavenCentral()' \
+            '        gradlePluginPortal()' \
+            '    }' \
+            '}' \
+            'dependencyResolutionManagement {' \
+            '    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)' \
+            '    repositories {' \
+            '        google()' \
+            '        mavenCentral()' \
+            '    }' \
+            '}' \
+            'rootProject.name = "RhodesLink"' \
+            'include(":app")' \
+            'include(":shared")' \
+            > settings.gradle.kts
+          echo "===== 重写后的 settings.gradle.kts ====="
           cat settings.gradle.kts
 
       - name: 赋予 Gradle 执行权限
