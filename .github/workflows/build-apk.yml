@@ -88,6 +88,12 @@ jobs:
       - name: 赋予 Gradle 执行权限
         run: chmod +x gradlew
 
+      # ===== 修复：创建 local.properties（提供签名密码，否则 APK 签名会失败）=====
+      - name: 创建 local.properties
+        run: |
+          echo "KEYSTORE_PASSWORD=rhodes2026" > local.properties
+          echo "sdk.dir=$ANDROID_HOME" >> local.properties
+
       - name: 构建 APK - arm64-v8a
         if: inputs.build_type == 'all' || inputs.build_type == 'arm64'
         run: |
